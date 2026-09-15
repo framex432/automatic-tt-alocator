@@ -1,5 +1,5 @@
 import { supabase } from './supabaseClient';
- 
+
 // ---------------------------------------------------------------------------
 // One source of truth for how each in-app collection maps to a real Postgres
 // table + column names. Keeping this in one place means every mutation site
@@ -19,7 +19,7 @@ const TABLE_BY_KEY = {
   timetableEntries: 'timetable_entries',
   activityLog: 'activity_log',
 };
- 
+
 // camelCase JS field -> snake_case DB column, per collection. Fields not listed
 // here are assumed to already match (e.g. id, name, type, capacity).
 const FIELD_MAP = {
@@ -39,7 +39,7 @@ const FIELD_MAP = {
   periods: { start: 'start_time', end: 'end_time' },
   activityLog: { entityType: 'entity_type', entityId: 'entity_id' },
 };
- 
+
 // Columns that don't exist as real DB columns for a table - derived instead
 // (subjects.facultyIds / faculty.subjectIds come from the subject_faculty
 // junction table, not a column).
@@ -47,7 +47,7 @@ const DERIVED_FIELDS = {
   subjects: ['facultyIds'],
   faculty: ['subjectIds'],
 };
- 
+
 function toRow(key, record) {
   const map = FIELD_MAP[key] || {};
   const skip = DERIVED_FIELDS[key] || [];
@@ -64,7 +64,7 @@ function toRow(key, record) {
   }
   return row;
 }
- 
+
 function fromRow(key, row) {
   const map = FIELD_MAP[key] || {};
   const reverse = Object.fromEntries(Object.entries(map).map(([js, db]) => [db, js]));
@@ -74,7 +74,7 @@ function fromRow(key, row) {
   }
   return obj;
 }
- 
+
 // ---------------------------------------------------------------------------
 // Load the whole app state from Supabase, shaped exactly like the old
 // localStorage blob so the rest of TimeSyncAI.jsx doesn't need to change.
@@ -107,17 +107,17 @@ export async function loadState() {
     supabase.from('subject_faculty').select('*'),
     supabase.from('college_settings').select('*').eq('id', 1).maybeSingle(),
   ]);
- 
+
   const firstError = eDept || eDay || ePeriod || eFac || eSub || eRoom || eLab || eCls || eTT || eAct || eJoin || eCollege;
   if (firstError) throw firstError;
- 
+
   const facultyIdsBySubject = {};
   const subjectIdsByFaculty = {};
   (subjectFaculty || []).forEach(({ subject_id, faculty_id }) => {
     (facultyIdsBySubject[subject_id] ||= []).push(faculty_id);
     (subjectIdsByFaculty[faculty_id] ||= []).push(subject_id);
   });
- 
+
   const faculty = (facultyRaw || []).map((r) => ({
     ...fromRow('faculty', r),
     subjectIds: subjectIdsByFaculty[r.id] || [],
@@ -139,7 +139,7 @@ export async function loadState() {
       facultyIds: facultyIdsBySubject[r.id] || [],
     };
   });
- 
+
   const college = collegeRows
     ? {
         name: collegeRows.name,
@@ -148,7 +148,7 @@ export async function loadState() {
         numPeriods: collegeRows.num_periods,
       }
     : { name: '', academicYear: '', workingDays: '', numPeriods: 6 };
- 
+
   return {
     college,
     departments: departments || [],
@@ -170,7 +170,7 @@ export async function loadState() {
     })),
   };
 }
- 
+
 // ---------------------------------------------------------------------------
 // Diff-based sync: TimeSyncAI.jsx builds a `next` state object the same way
 // it always has (spread + array map/filter) and hands both `prev` and `next`
@@ -183,7 +183,7 @@ async function syncCollection(key, prevList, nextList) {
   if (!table) return;
   const prevById = new Map((prevList || []).map((r) => [r.id, r]));
   const nextById = new Map((nextList || []).map((r) => [r.id, r]));
- 
+
   const inserts = [];
   const updates = [];
   for (const [id, record] of nextById) {
@@ -192,7 +192,7 @@ async function syncCollection(key, prevList, nextList) {
     else if (JSON.stringify(prevRecord) !== JSON.stringify(record)) updates.push(record);
   }
   const deletedIds = [...prevById.keys()].filter((id) => !nextById.has(id));
- 
+
   if (inserts.length) {
     const { error } = await supabase.from(table).insert(inserts.map((r) => toRow(key, r)));
     if (error) throw error;
@@ -205,7 +205,7 @@ async function syncCollection(key, prevList, nextList) {
     const { error } = await supabase.from(table).delete().in('id', deletedIds);
     if (error) throw error;
   }
- 
+
   // subjects own the editable end of the faculty<->subject relationship (see
   // SubjectsTab's "Faculty who can teach this" picker), so re-sync the
   // junction table whenever a subject's facultyIds changed.
@@ -237,7 +237,7 @@ async function syncCollection(key, prevList, nextList) {
     }
   }
 }
- 
+
 async function syncCollege(prevCollege, nextCollege) {
   if (JSON.stringify(prevCollege) === JSON.stringify(nextCollege)) return;
   const { error } = await supabase
@@ -251,7 +251,7 @@ async function syncCollege(prevCollege, nextCollege) {
     .eq('id', 1);
   if (error) throw error;
 }
- 
+
 export async function syncDiff(prevState, nextState) {
   await syncCollege(prevState.college, nextState.college);
   for (const key of Object.keys(TABLE_BY_KEY)) {

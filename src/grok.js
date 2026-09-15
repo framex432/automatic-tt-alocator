@@ -29,18 +29,18 @@
 // auth), but if this app is ever exposed publicly, move this fetch behind a
 // small server/edge function that holds the real key instead.
 // ---------------------------------------------------------------------------
- 
+
 const GROK_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROK_MODEL = 'openai/gpt-oss-120b';
- 
+
 function apiKey() {
   return import.meta.env.VITE_GROK_API_KEY;
 }
- 
+
 export function isGrokConfigured() {
   return Boolean(apiKey());
 }
- 
+
 // ---------------------------------------------------------------------------
 // Builds the instructions + the exact slice of master data Grok needs to fill
 // one class section's grid: its subjects (with weekly-hour targets and which
@@ -60,24 +60,24 @@ function buildPrompt({ state, departmentId, classSection, deptSubjects, periodSl
       eligibleFaculty: eligibleFaculty.map((f) => ({ facultyId: f.id, name: f.name, maxWeeklyHours: f.maxWeeklyHours, availability: f.availability })),
     };
   }).filter((s) => s.eligibleFaculty.length > 0); // can't schedule a subject with nobody to teach it
- 
+
   const rooms = [...state.classrooms, ...state.labs]
     .filter((r) => r.departmentId === departmentId)
     .map((r) => ({ roomId: r.id, name: r.name, type: r.type }));
- 
+
   const dayOrders = state.dayOrders.map((d) => ({ dayOrderId: d.id, label: d.label, actualDay: d.actualDay }));
   const periods = periodSlots.map((p) => ({ periodId: p.id, label: p.label }));
- 
+
   const busy = allOtherEntries.map((e) => ({
     dayOrderId: e.dayOrderId, periodId: e.periodId, facultyId: e.facultyId, roomId: e.roomId,
   }));
- 
+
   const alreadyFilled = existingEntriesForClass.map((e) => ({ dayOrderId: e.dayOrderId, periodId: e.periodId }));
- 
+
   const system = `You are a university timetable scheduling engine. You ONLY output strict JSON, nothing else - no markdown fences, no commentary, no explanations before or after.
- 
+
 Given a class section's subjects, the day-order/period grid, the rooms available, and a list of slots that are already busy elsewhere in the college, produce a JSON array of timetable entries that fills EVERY empty (dayOrderId, periodId) cell for this class section.
- 
+
 Hard rules:
 1. Never assign a (dayOrderId, periodId) pair that already appears in "alreadyFilled" - those cells are taken by an existing manual entry and must be left alone (do not include them in your output at all).
 2. Never assign a facultyId or roomId to a (dayOrderId, periodId) that already appears in "busyElsewhere" with that same facultyId or roomId - that faculty member or room is already teaching another class at that exact time.
@@ -87,10 +87,10 @@ Hard rules:
 6. type: "Lab" subjects should use a room whose type is "lab" when one is available; type: "Theory" subjects should use a room whose type is "classroom" when one is available. If no room of the matching type exists in the given room list, pick any available room from the list rather than skip the subject.
 7. NEVER invent a roomId, facultyId, or subjectId that is not present in the lists given to you. A room is OPTIONAL: if the "rooms" list is empty, or none of the available rooms are free at that slot, set "roomId" to null and still place the entry (subject/faculty scheduling must never be blocked by a missing room) - do not guess or invent a roomId under any circumstances.
 8. It is fine, and expected, to leave a cell empty (omit it) if no subject/faculty combination can be legally placed there (e.g. no eligible faculty is free).
- 
+
 Output format - a JSON array only, each item exactly:
 {"dayOrderId": string, "periodId": string, "subjectId": string, "facultyId": string, "roomId": string | null, "type": "theory" | "lab"}`;
- 
+
   const user = JSON.stringify({
     department: departmentId,
     classSection: { year: classSection.year, section: classSection.section, batch: classSection.batch },
@@ -101,10 +101,10 @@ Output format - a JSON array only, each item exactly:
     alreadyFilled,
     busyElsewhere: busy,
   });
- 
+
   return { system, user };
 }
- 
+
 function extractJsonArray(text) {
   // Grok is instructed to return raw JSON, but strip ```json fences defensively
   // in case the model wraps it anyway.
@@ -116,7 +116,7 @@ function extractJsonArray(text) {
   }
   return JSON.parse(cleaned.slice(start, end + 1));
 }
- 
+
 // ---------------------------------------------------------------------------
 // Calls Grok and returns a validated list of NEW timetable entries (ready to
 // merge into state.timetableEntries) for one class section. Throws with a
@@ -127,12 +127,12 @@ export async function generateTimetableWithAI({ state, departmentId, classSectio
   if (!key) {
     throw new Error('No Groq API key found. Add VITE_GROK_API_KEY to .env.local (get a key at console.groq.com/keys - this calls Groq, not x.ai) and restart the dev server.');
   }
- 
+
   const existingEntriesForClass = state.timetableEntries.filter((e) => e.classSectionId === classSection.id);
   const allOtherEntries = state.timetableEntries.filter((e) => e.classSectionId !== classSection.id);
- 
+
   const { system, user } = buildPrompt({ state, departmentId, classSection, deptSubjects, periodSlots, existingEntriesForClass, allOtherEntries });
- 
+
   let response;
   try {
     response = await fetch(GROK_API_URL, {
@@ -150,7 +150,7 @@ export async function generateTimetableWithAI({ state, departmentId, classSectio
   } catch (err) {
     throw new Error('Could not reach Grok (' + (err?.message || 'network error') + ').');
   }
- 
+
   if (!response.ok) {
     // Groq's error body isn't always shaped like OpenAI's `{ error: { message } }` -
     // it's often flat: `{ code: "...", error: "some string" }`. Try every shape
@@ -171,18 +171,18 @@ export async function generateTimetableWithAI({ state, departmentId, classSectio
     }
     throw new Error('Groq API error ' + response.status + (detail ? ': ' + detail : ' (no further detail in the response body).'));
   }
- 
+
   const data = await response.json();
   const text = data?.choices?.[0]?.message?.content;
   if (!text) throw new Error('Grok returned an empty response.');
- 
+
   let raw;
   try {
     raw = extractJsonArray(text);
   } catch {
     throw new Error('Could not parse Grok\u2019s response as JSON.');
   }
- 
+
   // --- Validate every entry against real master data before it ever touches
   // state - an AI response is untrusted input, same as a form submission.
   const validPeriodIds = new Set(periodSlots.map((p) => p.id));
@@ -191,14 +191,14 @@ export async function generateTimetableWithAI({ state, departmentId, classSectio
   const facultyById = new Map(state.faculty.map((f) => [f.id, f]));
   const roomById = new Map([...state.classrooms, ...state.labs].map((r) => [r.id, r]));
   const filledCells = new Set(existingEntriesForClass.map((e) => e.dayOrderId + '|' + e.periodId));
- 
+
   const busyFaculty = new Set(allOtherEntries.map((e) => e.dayOrderId + '|' + e.periodId + '|' + e.facultyId));
   const busyRoom = new Set(allOtherEntries.map((e) => e.dayOrderId + '|' + e.periodId + '|' + e.roomId));
- 
+
   const seenCells = new Set();
   const skipped = [];
   const entries = [];
- 
+
   for (const item of Array.isArray(raw) ? raw : []) {
     const { dayOrderId, periodId, subjectId, facultyId, type } = item || {};
     // Room is optional: treat any falsy value (null, undefined, '', 0) as "no room
@@ -209,7 +209,7 @@ export async function generateTimetableWithAI({ state, departmentId, classSectio
     const subject = subjectsById.get(subjectId);
     const faculty = facultyById.get(facultyId);
     const room = roomId ? roomById.get(roomId) : null;
- 
+
     const reasons = [];
     if (!validDayOrderIds.has(dayOrderId) || !validPeriodIds.has(periodId)) reasons.push('unknown day/period');
     if (filledCells.has(cellKey)) reasons.push('cell already filled');
@@ -219,12 +219,12 @@ export async function generateTimetableWithAI({ state, departmentId, classSectio
     if (roomId && !room) reasons.push('unknown room');
     if (busyFaculty.has(dayOrderId + '|' + periodId + '|' + facultyId)) reasons.push('faculty double-booked');
     if (roomId && busyRoom.has(dayOrderId + '|' + periodId + '|' + roomId)) reasons.push('room double-booked');
- 
+
     if (reasons.length) {
       skipped.push({ item, reasons });
       continue;
     }
- 
+
     seenCells.add(cellKey);
     entries.push({
       id: 'TT-' + Math.random().toString(36).slice(2, 9),
@@ -233,6 +233,6 @@ export async function generateTimetableWithAI({ state, departmentId, classSectio
       type: type === 'lab' ? 'lab' : 'theory',
     });
   }
- 
+
   return { entries, skipped };
 }

@@ -2043,6 +2043,13 @@ function CreateTimetable({ state, actions, conflicts }) {
                       const isConflicted = entry && conflicts.some((c) => c.entryA.id === entry.id || c.entryB.id === entry.id);
                       const subj = entry && state.subjects.find((s) => s.id === entry.subjectId);
                       const fac = entry && state.faculty.find((f) => f.id === entry.facultyId);
+                      // Room is optional on an entry - look it up only when one is actually
+                      // assigned, and show a plain "-" (not blank, not an error) when it isn't,
+                      // so the cell always makes it obvious a room was never required to schedule
+                      // this slot in the first place.
+                      const room = entry?.roomId
+                        ? state.classrooms.find((r) => r.id === entry.roomId) || state.labs.find((r) => r.id === entry.roomId)
+                        : null;
                       return (
                         <td
                           key={p.id}
@@ -2054,6 +2061,7 @@ function CreateTimetable({ state, actions, conflicts }) {
                             <div>
                               <p className="font-semibold" style={{ color: T.ink }}>{subj?.name}</p>
                               <p style={{ color: T.muted }}>{fac?.name}</p>
+                              <p className="ts-mono" style={{ color: T.muted }}>{room ? room.name : '-'}</p>
                               {isConflicted && <p className="mt-0.5 font-semibold" style={{ color: T.critical }}>Conflict</p>}
                             </div>
                           ) : (
