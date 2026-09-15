@@ -1353,6 +1353,7 @@ function DepartmentsTab({ state, actions, highlightId = null }) {
 }
 
 function FacultyTab({ state, actions, onAdd }) {
+  const [editingFaculty, setEditingFaculty] = useState(null);
   return (
     <div>
       <div className="mb-3 flex items-center justify-between">
@@ -1382,7 +1383,27 @@ function FacultyTab({ state, actions, onAdd }) {
                     <td className="px-4 py-2.5" style={{ color: T.ink }}>{f.designation}</td>
                     <td className="px-4 py-2.5" style={{ color: T.ink }}>{load} / {f.maxWeeklyHours}</td>
                     <td className="px-4 py-2.5 text-right">
-                      <button onClick={() => { actions.deleteRecord('faculty', f.id, 'Faculty removed: ' + f.name); actions.toast('Faculty removed.'); }} className="rounded-md p-1.5 hover:bg-gray-100">
+                      <button onClick={() => setEditingFaculty(f)} className="rounded-md p-1.5 hover:bg-gray-100" title="Edit faculty">
+                        <Pencil size={14} color={T.primary} />
+                      </button>
+                      <button
+                        onClick={() => {
+                          // Same dependency protection Departments already has - without this,
+                          // deleting a faculty who still has timetable slots assigned leaves
+                          // those entries pointing at a facultyId that no longer exists, and
+                          // the grid just silently shows a blank faculty line (subject + room
+                          // only) with no explanation.
+                          const assignedCount = state.timetableEntries.filter((e) => e.facultyId === f.id).length;
+                          if (assignedCount > 0) {
+                            actions.toast('Can\u2019t delete ' + f.name + ' \u2014 they\u2019re still assigned to ' + assignedCount + ' timetable slot(s). Clear or reassign those in Create Timetable first.', 'critical');
+                            return;
+                          }
+                          actions.deleteRecord('faculty', f.id, 'Faculty removed: ' + f.name);
+                          actions.toast('Faculty removed.');
+                        }}
+                        className="rounded-md p-1.5 hover:bg-gray-100"
+                        title="Delete faculty"
+                      >
                         <Trash2 size={14} color={T.critical} />
                       </button>
                     </td>
@@ -1393,11 +1414,12 @@ function FacultyTab({ state, actions, onAdd }) {
           </table>
         </Card>
       )}
+      {editingFaculty && <AddFacultyModal state={state} actions={actions} editing={editingFaculty} onClose={() => setEditingFaculty(null)} />}
     </div>
   );
 }
 
-function SubjectRow({ s, state, actions, highlightId }) {
+function SubjectRow({ s, state, actions, highlightId, onEdit }) {
   const [flashing, ref] = useFlashHighlight(highlightId, s.id);
   return (
     <tr ref={ref} className="border-t" style={{ borderColor: T.border, background: flashing ? T.primaryTint : 'transparent', boxShadow: flashing ? `inset 0 0 0 1px ${T.primary}` : 'none' }}>
@@ -1413,6 +1435,9 @@ function SubjectRow({ s, state, actions, highlightId }) {
       <td className="px-4 py-2.5" style={{ color: T.ink }}>{state.faculty.filter((f) => s.facultyIds.includes(f.id)).map((f) => f.name).join(', ') || '\u2014'}</td>
       <td className="px-4 py-2.5" style={{ color: T.ink }}>{s.weeklyHours}</td>
       <td className="px-4 py-2.5 text-right">
+        <button onClick={() => onEdit(s)} className="rounded-md p-1.5 hover:bg-gray-100" title="Edit subject">
+          <Pencil size={14} color={T.primary} />
+        </button>
         <button
           onClick={() => { actions.deleteRecord('subjects', s.id, 'Subject removed: ' + s.name); actions.toast('Subject removed.'); }}
           className="rounded-md p-1.5 hover:bg-gray-100"
@@ -1432,6 +1457,23 @@ const EMPTY_SUBJECT_FORM = (state) => ({
 
 function SubjectsTab({ state, actions, highlightId = null }) {
   const [form, setForm] = useState(() => EMPTY_SUBJECT_FORM(state));
+  // Non-null while editing an existing subject instead of creating a new one -
+  // the same form below is reused for both, just its submit target changes.
+  const [editingId, setEditingId] = useState(null);
+  const formCardRef = React.useRef(null);
+
+  function startEdit(s) {
+    // eslint-disable-next-line no-unused-vars
+    const { id, labRequired, ...rest } = s;
+    setForm({ ...rest, departmentIds: s.departmentIds || [], facultyIds: s.facultyIds || [] });
+    setEditingId(s.id);
+    formCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+    setForm(EMPTY_SUBJECT_FORM(state));
+  }
 
   // A subject can now belong to more than one department at once (e.g. a common
   // "Mathematics II" paper taught to II-year CSE, AIDS and IT alike) - this is the
@@ -1451,14 +1493,14 @@ function SubjectsTab({ state, actions, highlightId = null }) {
           </thead>
           <tbody>
             {state.subjects.map((s) => (
-              <SubjectRow key={s.id} s={s} state={state} actions={actions} highlightId={highlightId} />
+              <SubjectRow key={s.id} s={s} state={state} actions={actions} highlightId={highlightId} onEdit={startEdit} />
             ))}
           </tbody>
         </table>
       </Card>
 
-      <Card className="max-w-2xl p-4">
-        <p className="ts-display mb-3 text-sm font-semibold" style={{ color: T.ink }}>Add subject</p>
+      <Card ref={formCardRef} className="max-w-2xl p-4" style={editingId ? { boxShadow: `0 0 0 2px ${T.primary}` } : {}}>
+        <p className="ts-display mb-3 text-sm font-semibold" style={{ color: T.ink }}>{editingId ? 'Edit subject' : 'Add subject'}</p>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
           <Field label="Subject code"><Input value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value })} /></Field>
           <Field label="Subject name"><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></Field>
@@ -1525,19 +1567,26 @@ function SubjectsTab({ state, actions, highlightId = null }) {
             {form.departmentIds.length === 0 && <p className="text-xs" style={{ color: T.muted }}>Pick at least one department first.</p>}
           </div>
         </div>
-        <div className="mt-4">
+        <div className="mt-4 flex gap-2">
           <PrimaryButton
-            icon={Plus}
+            icon={editingId ? undefined : Plus}
             onClick={() => {
               if (!form.code || !form.name) { actions.toast('Enter a subject code and name.', 'critical'); return; }
               if (form.departmentIds.length === 0) { actions.toast('Choose at least one department.', 'critical'); return; }
-              actions.addRecord('subjects', { id: uid('SUB'), labRequired: form.type === 'Lab', ...form }, 'Subject added: ' + form.name);
-              setForm(EMPTY_SUBJECT_FORM(state));
-              actions.toast('Subject added.');
+              if (editingId) {
+                actions.updateRecord('subjects', editingId, { ...form, labRequired: form.type === 'Lab' }, 'Subject updated: ' + form.name);
+                actions.toast('Subject updated.');
+                cancelEdit();
+              } else {
+                actions.addRecord('subjects', { id: uid('SUB'), labRequired: form.type === 'Lab', ...form }, 'Subject added: ' + form.name);
+                setForm(EMPTY_SUBJECT_FORM(state));
+                actions.toast('Subject added.');
+              }
             }}
           >
-            Add subject
+            {editingId ? 'Save changes' : 'Add subject'}
           </PrimaryButton>
+          {editingId && <GhostButton onClick={cancelEdit}>Cancel edit</GhostButton>}
         </div>
       </Card>
     </div>
@@ -1627,8 +1676,8 @@ function RoomsTab({ state, actions, highlightId = null }) {
   );
 }
 
-function AddFacultyModal({ state, actions, onClose }) {
-  const [form, setForm] = useState({
+function AddFacultyModal({ state, actions, onClose, editing = null }) {
+  const [form, setForm] = useState(() => editing ? { ...editing } : {
     id: 'FAC-' + (state.departments[0]?.id || 'GEN') + '-' + String(state.faculty.length + 1).padStart(3, '0'),
     name: '', departmentId: state.departments[0]?.id || '', designation: 'Assistant Professor',
     email: '', phone: '', subjectIds: [], maxWeeklyHours: 20, availability: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'],
@@ -1637,15 +1686,26 @@ function AddFacultyModal({ state, actions, onClose }) {
 
   function submit() {
     if (!form.name || !form.email) { actions.toast('Enter a name and email.', 'critical'); return; }
-    actions.addRecord('faculty', form, 'New faculty added: ' + form.name);
-    actions.toast('Faculty added successfully.');
+    if (editing) {
+      actions.updateRecord('faculty', editing.id, form, 'Faculty updated: ' + form.name);
+      actions.toast('Faculty updated.');
+    } else {
+      actions.addRecord('faculty', form, 'New faculty added: ' + form.name);
+      actions.toast('Faculty added successfully.');
+    }
     onClose();
   }
 
   return (
-    <Modal open onClose={onClose} title="Add faculty">
+    <Modal open onClose={onClose} title={editing ? 'Edit faculty' : 'Add faculty'}>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <Field label="Faculty ID"><Input value={form.id} onChange={(e) => setForm({ ...form, id: e.target.value })} /></Field>
+        <Field label="Faculty ID">
+          {editing ? (
+            <p className="ts-mono rounded-lg border px-3 py-2 text-sm" style={{ borderColor: T.border, color: T.muted, background: T.bg }}>{form.id}</p>
+          ) : (
+            <Input value={form.id} onChange={(e) => setForm({ ...form, id: e.target.value })} />
+          )}
+        </Field>
         <Field label="Faculty name"><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Dr. Arun Kumar" /></Field>
         <Field label="Department">
           <Select value={form.departmentId} onChange={(e) => setForm({ ...form, departmentId: e.target.value })}>
@@ -1702,7 +1762,7 @@ function AddFacultyModal({ state, actions, onClose }) {
       </div>
 
       <div className="mt-5 flex gap-2">
-        <PrimaryButton onClick={submit}>Add faculty</PrimaryButton>
+        <PrimaryButton onClick={submit}>{editing ? 'Save changes' : 'Add faculty'}</PrimaryButton>
         <GhostButton onClick={onClose}>Cancel</GhostButton>
       </div>
     </Modal>
