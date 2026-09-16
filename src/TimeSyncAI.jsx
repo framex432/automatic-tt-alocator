@@ -1354,14 +1354,48 @@ function DepartmentsTab({ state, actions, highlightId = null }) {
 
 function FacultyTab({ state, actions, onAdd }) {
   const [editingFaculty, setEditingFaculty] = useState(null);
+  const [search, setSearch] = useState('');
+  const [deptFilter, setDeptFilter] = useState('ALL');
+  const [designationFilter, setDesignationFilter] = useState('ALL');
+
+  const filtered = state.faculty.filter((f) =>
+    (deptFilter === 'ALL' || f.departmentId === deptFilter) &&
+    (designationFilter === 'ALL' || f.designation === designationFilter) &&
+    (f.name.toLowerCase().includes(search.toLowerCase()) || f.id.toLowerCase().includes(search.toLowerCase()))
+  );
+  const filtersActive = search || deptFilter !== 'ALL' || designationFilter !== 'ALL';
+
   return (
     <div>
       <div className="mb-3 flex items-center justify-between">
-        <p className="text-sm" style={{ color: T.muted }}>{state.faculty.length} faculty members across {state.departments.length} departments.</p>
+        <p className="text-sm" style={{ color: T.muted }}>
+          {filtersActive ? filtered.length + ' of ' + state.faculty.length : state.faculty.length} faculty members across {state.departments.length} departments.
+        </p>
         <PrimaryButton icon={Plus} onClick={onAdd}>Add faculty</PrimaryButton>
       </div>
+
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <div className="relative">
+          <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2" color={T.muted} />
+          <Input placeholder="Search name or ID" value={search} onChange={(e) => setSearch(e.target.value)} className="w-48 pl-8" />
+        </div>
+        <Select value={deptFilter} onChange={(e) => setDeptFilter(e.target.value)} className="w-36">
+          <option value="ALL">All departments</option>
+          {state.departments.map((d) => <option key={d.id} value={d.id}>{d.id}</option>)}
+        </Select>
+        <Select value={designationFilter} onChange={(e) => setDesignationFilter(e.target.value)} className="w-44">
+          <option value="ALL">All designations</option>
+          {['Professor', 'Associate Professor', 'Assistant Professor'].map((d) => <option key={d} value={d}>{d}</option>)}
+        </Select>
+        {filtersActive && (
+          <GhostButton onClick={() => { setSearch(''); setDeptFilter('ALL'); setDesignationFilter('ALL'); }}>Clear filters</GhostButton>
+        )}
+      </div>
+
       {state.faculty.length === 0 ? (
         <EmptyState icon={Users} title="No faculty members found." subtitle="Add faculty to begin building your academic master data." actionLabel="Add faculty" onAction={onAdd} />
+      ) : filtered.length === 0 ? (
+        <EmptyState icon={Users} title="No faculty match these filters." subtitle="Try a different search term or clear the filters." />
       ) : (
         <Card className="overflow-x-auto">
           <table className="w-full text-sm">
@@ -1373,7 +1407,7 @@ function FacultyTab({ state, actions, onAdd }) {
               </tr>
             </thead>
             <tbody>
-              {state.faculty.map((f) => {
+              {filtered.map((f) => {
                 const load = state.subjects.filter((s) => s.facultyIds.includes(f.id)).reduce((sum, s) => sum + s.weeklyHours, 0);
                 return (
                   <tr key={f.id} className="border-t" style={{ borderColor: T.border }}>
@@ -1480,24 +1514,67 @@ function SubjectsTab({ state, actions, highlightId = null }) {
   // same year/semester subject, just shared, not one row per department.
   const eligibleFaculty = state.faculty.filter((f) => form.departmentIds.includes(f.departmentId));
 
+  const [search, setSearch] = useState('');
+  const [deptFilter, setDeptFilter] = useState('ALL');
+  const [yearFilter, setYearFilter] = useState('ALL');
+  const [typeFilter, setTypeFilter] = useState('ALL');
+
+  const filteredSubjects = state.subjects.filter((s) =>
+    (deptFilter === 'ALL' || (s.departmentIds || []).includes(deptFilter)) &&
+    (yearFilter === 'ALL' || s.year === yearFilter) &&
+    (typeFilter === 'ALL' || s.type === typeFilter) &&
+    (s.name.toLowerCase().includes(search.toLowerCase()) || s.code.toLowerCase().includes(search.toLowerCase()))
+  );
+  const subjectFiltersActive = search || deptFilter !== 'ALL' || yearFilter !== 'ALL' || typeFilter !== 'ALL';
+
   return (
     <div>
-      <Card className="mb-5 overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead>
-            <tr style={{ background: T.bg }}>
-              {['Code', 'Name', 'Department(s)', 'Year', 'Type', 'Faculty', 'Hours', ''].map((h) => (
-                <th key={h || 'actions'} className="whitespace-nowrap px-4 py-2.5 text-left font-semibold" style={{ color: T.muted }}>{h}</th>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <div className="relative">
+          <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2" color={T.muted} />
+          <Input placeholder="Search code or name" value={search} onChange={(e) => setSearch(e.target.value)} className="w-48 pl-8" />
+        </div>
+        <Select value={deptFilter} onChange={(e) => setDeptFilter(e.target.value)} className="w-36">
+          <option value="ALL">All departments</option>
+          {state.departments.map((d) => <option key={d.id} value={d.id}>{d.id}</option>)}
+        </Select>
+        <Select value={yearFilter} onChange={(e) => setYearFilter(e.target.value)} className="w-28">
+          <option value="ALL">All years</option>
+          {['I', 'II', 'III', 'IV'].map((y) => <option key={y} value={y}>{y}</option>)}
+        </Select>
+        <Select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)} className="w-32">
+          <option value="ALL">All types</option>
+          <option value="Theory">Theory</option>
+          <option value="Lab">Lab</option>
+        </Select>
+        {subjectFiltersActive && (
+          <GhostButton onClick={() => { setSearch(''); setDeptFilter('ALL'); setYearFilter('ALL'); setTypeFilter('ALL'); }}>Clear filters</GhostButton>
+        )}
+        <span className="text-xs" style={{ color: T.muted }}>
+          {subjectFiltersActive ? filteredSubjects.length + ' of ' + state.subjects.length : state.subjects.length} subjects
+        </span>
+      </div>
+
+      {state.subjects.length > 0 && filteredSubjects.length === 0 ? (
+        <EmptyState icon={BookOpen} title="No subjects match these filters." subtitle="Try a different search term or clear the filters." />
+      ) : (
+        <Card className="mb-5 overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr style={{ background: T.bg }}>
+                {['Code', 'Name', 'Department(s)', 'Year', 'Type', 'Faculty', 'Hours', ''].map((h) => (
+                  <th key={h || 'actions'} className="whitespace-nowrap px-4 py-2.5 text-left font-semibold" style={{ color: T.muted }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filteredSubjects.map((s) => (
+                <SubjectRow key={s.id} s={s} state={state} actions={actions} highlightId={highlightId} onEdit={startEdit} />
               ))}
-            </tr>
-          </thead>
-          <tbody>
-            {state.subjects.map((s) => (
-              <SubjectRow key={s.id} s={s} state={state} actions={actions} highlightId={highlightId} onEdit={startEdit} />
-            ))}
-          </tbody>
-        </table>
-      </Card>
+            </tbody>
+          </table>
+        </Card>
+      )}
 
       <Card ref={formCardRef} className="max-w-2xl p-4" style={editingId ? { boxShadow: `0 0 0 2px ${T.primary}` } : {}}>
         <p className="ts-display mb-3 text-sm font-semibold" style={{ color: T.ink }}>{editingId ? 'Edit subject' : 'Add subject'}</p>
