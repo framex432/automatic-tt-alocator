@@ -1432,7 +1432,14 @@ function FacultyTab({ state, actions, onAdd }) {
                             actions.toast('Can\u2019t delete ' + f.name + ' \u2014 they\u2019re still assigned to ' + assignedCount + ' timetable slot(s). Clear or reassign those in Create Timetable first.', 'critical');
                             return;
                           }
-                          actions.deleteRecord('faculty', f.id, 'Faculty removed: ' + f.name);
+                          // Scrub this faculty's id out of every subject.facultyIds too -
+                          // otherwise a subject that listed them keeps a dangling reference
+                          // and the same "name silently disappears" symptom the timetable
+                          // grid had before shows up in the Subjects table's Faculty column.
+                          const nextSubjects = state.subjects.some((s) => (s.facultyIds || []).includes(f.id))
+                            ? state.subjects.map((s) => ((s.facultyIds || []).includes(f.id) ? { ...s, facultyIds: s.facultyIds.filter((id) => id !== f.id) } : s))
+                            : state.subjects;
+                          actions.persist(actions.logActivity({ ...state, faculty: state.faculty.filter((x) => x.id !== f.id), subjects: nextSubjects }, 'Faculty removed: ' + f.name));
                           actions.toast('Faculty removed.');
                         }}
                         className="rounded-md p-1.5 hover:bg-gray-100"
@@ -1473,7 +1480,16 @@ function SubjectRow({ s, state, actions, highlightId, onEdit }) {
           <Pencil size={14} color={T.primary} />
         </button>
         <button
-          onClick={() => { actions.deleteRecord('subjects', s.id, 'Subject removed: ' + s.name); actions.toast('Subject removed.'); }}
+          onClick={() => {
+            // Same dangling-reference cleanup as the faculty-delete side: strip this
+            // subject's id out of every faculty.subjectIds so nobody's "Subjects handled"
+            // list keeps pointing at a subject that no longer exists.
+            const nextFaculty = state.faculty.some((f) => (f.subjectIds || []).includes(s.id))
+              ? state.faculty.map((f) => ((f.subjectIds || []).includes(s.id) ? { ...f, subjectIds: f.subjectIds.filter((id) => id !== s.id) } : f))
+              : state.faculty;
+            actions.persist(actions.logActivity({ ...state, subjects: state.subjects.filter((x) => x.id !== s.id), faculty: nextFaculty }, 'Subject removed: ' + s.name));
+            actions.toast('Subject removed.');
+          }}
           className="rounded-md p-1.5 hover:bg-gray-100"
           title="Delete subject"
         >
@@ -1651,11 +1667,33 @@ function SubjectsTab({ state, actions, highlightId = null }) {
               if (!form.code || !form.name) { actions.toast('Enter a subject code and name.', 'critical'); return; }
               if (form.departmentIds.length === 0) { actions.toast('Choose at least one department.', 'critical'); return; }
               if (editingId) {
-                actions.updateRecord('subjects', editingId, { ...form, labRequired: form.type === 'Lab' }, 'Subject updated: ' + form.name);
+                // Same facultyIds <-> subjectIds mirroring as the faculty side (see
+                // AddFacultyModal.submit) - keep both directions of the relationship
+                // in sync in one save instead of only writing this subject's side.
+                const prevSubject = state.subjects.find((x) => x.id === editingId);
+                const prevFacultyIds = prevSubject?.facultyIds || [];
+                const nextFacultyIds = form.facultyIds || [];
+                const added = nextFacultyIds.filter((id) => !prevFacultyIds.includes(id));
+                const removed = prevFacultyIds.filter((id) => !nextFacultyIds.includes(id));
+                const nextFaculty = (added.length || removed.length)
+                  ? state.faculty.map((f) => {
+                      if (added.includes(f.id)) return f.subjectIds.includes(editingId) ? f : { ...f, subjectIds: [...f.subjectIds, editingId] };
+                      if (removed.includes(f.id)) return { ...f, subjectIds: f.subjectIds.filter((sid) => sid !== editingId) };
+                      return f;
+                    })
+                  : state.faculty;
+                const nextSubjects = state.subjects.map((s) => (s.id === editingId ? { ...s, ...form, labRequired: form.type === 'Lab' } : s));
+                actions.persist(actions.logActivity({ ...state, subjects: nextSubjects, faculty: nextFaculty }, 'Subject updated: ' + form.name));
                 actions.toast('Subject updated.');
                 cancelEdit();
               } else {
-                actions.addRecord('subjects', { id: uid('SUB'), labRequired: form.type === 'Lab', ...form }, 'Subject added: ' + form.name);
+                const newId = uid('SUB');
+                const facultyIds = form.facultyIds || [];
+                const nextFaculty = facultyIds.length
+                  ? state.faculty.map((f) => (facultyIds.includes(f.id) ? { ...f, subjectIds: f.subjectIds.includes(newId) ? f.subjectIds : [...f.subjectIds, newId] } : f))
+                  : state.faculty;
+                const newSubject = { id: newId, labRequired: form.type === 'Lab', ...form };
+                actions.persist(actions.logActivity({ ...state, subjects: [...state.subjects, newSubject], faculty: nextFaculty }, 'Subject added: ' + form.name));
                 setForm(EMPTY_SUBJECT_FORM(state));
                 actions.toast('Subject added.');
               }
@@ -1763,13 +1801,32 @@ function AddFacultyModal({ state, actions, onClose, editing = null }) {
 
   function submit() {
     if (!form.name || !form.email) { actions.toast('Enter a name and email.', 'critical'); return; }
-    if (editing) {
-      actions.updateRecord('faculty', editing.id, form, 'Faculty updated: ' + form.name);
-      actions.toast('Faculty updated.');
-    } else {
-      actions.addRecord('faculty', form, 'New faculty added: ' + form.name);
-      actions.toast('Faculty added successfully.');
-    }
+
+    // subject.facultyIds and faculty.subjectIds describe the same relationship from
+    // opposite ends and were drifting apart - checking a subject here only ever wrote
+    // faculty.subjectIds, so the Subjects table (which reads subject.facultyIds) never
+    // saw it. Whenever the picks here change, mirror the diff onto every affected
+    // subject's facultyIds in the same save, so both sides always agree.
+    const facultyId = editing ? editing.id : form.id;
+    const prevSubjectIds = editing?.subjectIds || [];
+    const nextSubjectIds = form.subjectIds || [];
+    const added = nextSubjectIds.filter((id) => !prevSubjectIds.includes(id));
+    const removed = prevSubjectIds.filter((id) => !nextSubjectIds.includes(id));
+    const nextSubjects = (added.length || removed.length)
+      ? state.subjects.map((s) => {
+          if (added.includes(s.id)) return s.facultyIds.includes(facultyId) ? s : { ...s, facultyIds: [...s.facultyIds, facultyId] };
+          if (removed.includes(s.id)) return { ...s, facultyIds: s.facultyIds.filter((fid) => fid !== facultyId) };
+          return s;
+        })
+      : state.subjects;
+
+    const nextFaculty = editing
+      ? state.faculty.map((f) => (f.id === editing.id ? { ...f, ...form } : f))
+      : [...state.faculty, form];
+    const activityText = editing ? 'Faculty updated: ' + form.name : 'New faculty added: ' + form.name;
+
+    actions.persist(actions.logActivity({ ...state, faculty: nextFaculty, subjects: nextSubjects }, activityText));
+    actions.toast(editing ? 'Faculty updated.' : 'Faculty added successfully.');
     onClose();
   }
 
