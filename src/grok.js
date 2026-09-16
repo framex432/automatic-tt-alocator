@@ -33,6 +33,43 @@
 const GROK_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROK_MODEL = 'openai/gpt-oss-120b';
 
+// Groq's free tier caps tokens-per-minute (not requests-per-minute) - clicking
+// "Generate with AI" a few times in a row across departments can burn through
+// that budget and get a 429 back, even though the key/request are both fine.
+// Rather than surfacing that as a hard failure, retry automatically: Groq's
+// 429 body tells us almost exactly how long to wait ("Please try again in
+// 2.7375s"), so parse that (falling back to a Retry-After header, then a
+// plain default) and try again a few times before giving up for real.
+const MAX_429_RETRIES = 3;
+const DEFAULT_RETRY_MS = 5000;
+const MAX_RETRY_MS = 20000;
+
+async function fetchWithRetry(url, options, onRetry, attempt = 0) {
+  const response = await fetch(url, options);
+  if (response.status !== 429 || attempt >= MAX_429_RETRIES) return response;
+
+  let waitMs = DEFAULT_RETRY_MS;
+  const retryAfterHeader = response.headers.get('retry-after');
+  if (retryAfterHeader && !Number.isNaN(Number(retryAfterHeader))) {
+    waitMs = Math.ceil(Number(retryAfterHeader) * 1000);
+  } else {
+    // Read the body from a clone - the original response still needs to be
+    // readable by the normal error-handling path below if this was the last
+    // attempt, and a Response body can only be consumed once.
+    try {
+      const body = await response.clone().json();
+      const msg = body?.error?.message || (typeof body?.error === 'string' ? body.error : '') || '';
+      const match = msg.match(/try again in ([\d.]+)s/i);
+      if (match) waitMs = Math.ceil(parseFloat(match[1]) * 1000);
+    } catch { /* not JSON, or no hint in it - use the default */ }
+  }
+  waitMs = Math.min(waitMs, MAX_RETRY_MS) + 300; // small buffer so we don't race Groq's own clock
+
+  onRetry?.(attempt + 1, waitMs);
+  await new Promise((resolve) => setTimeout(resolve, waitMs));
+  return fetchWithRetry(url, options, onRetry, attempt + 1);
+}
+
 function apiKey() {
   return import.meta.env.VITE_GROK_API_KEY;
 }
@@ -122,7 +159,7 @@ function extractJsonArray(text) {
 // merge into state.timetableEntries) for one class section. Throws with a
 // human-readable message on any failure - the caller is expected to toast it.
 // ---------------------------------------------------------------------------
-export async function generateTimetableWithAI({ state, departmentId, classSection, deptSubjects, periodSlots }) {
+export async function generateTimetableWithAI({ state, departmentId, classSection, deptSubjects, periodSlots, onRetry }) {
   const key = apiKey();
   if (!key) {
     throw new Error('No Groq API key found. Add VITE_GROK_API_KEY to .env.local (get a key at console.groq.com/keys - this calls Groq, not x.ai) and restart the dev server.');
@@ -135,7 +172,7 @@ export async function generateTimetableWithAI({ state, departmentId, classSectio
 
   let response;
   try {
-    response = await fetch(GROK_API_URL, {
+    response = await fetchWithRetry(GROK_API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
       body: JSON.stringify({
@@ -146,7 +183,7 @@ export async function generateTimetableWithAI({ state, departmentId, classSectio
           { role: 'user', content: user },
         ],
       }),
-    });
+    }, onRetry);
   } catch (err) {
     throw new Error('Could not reach Grok (' + (err?.message || 'network error') + ').');
   }
@@ -168,6 +205,9 @@ export async function generateTimetableWithAI({ state, departmentId, classSectio
     }
     if (response.status === 404) {
       throw new Error('Groq model "' + GROK_MODEL + '" was not found for this account (HTTP 404). ' + (detail || 'Check the model is available on your Groq plan at console.groq.com.'));
+    }
+    if (response.status === 429) {
+      throw new Error('Groq is still rate-limited after ' + MAX_429_RETRIES + ' automatic retries. Wait a bit longer and try again, or reduce how often "Generate with AI" is clicked back-to-back across departments.');
     }
     throw new Error('Groq API error ' + response.status + (detail ? ': ' + detail : ' (no further detail in the response body).'));
   }

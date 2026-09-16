@@ -2096,6 +2096,12 @@ function CreateTimetable({ state, actions, conflicts }) {
     try {
       const { entries, skipped } = await generateTimetableWithAI({
         state, departmentId, classSection, deptSubjects, periodSlots,
+        // Groq's per-minute token limit can trip a 429 on a busy session - the fetch
+        // layer already retries automatically, this just keeps the person informed
+        // instead of the button looking stuck for up to ~20s per retry.
+        onRetry: (attempt, waitMs) => {
+          actions.toast('Groq rate limit hit \u2014 retrying automatically in ' + Math.round(waitMs / 1000) + 's (attempt ' + attempt + ')\u2026', 'warn');
+        },
       });
 
       // Always keep whatever Grok managed to place, however small - the
