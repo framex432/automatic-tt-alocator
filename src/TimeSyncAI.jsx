@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   LayoutDashboard, Database, Users, Calendar, AlertTriangle, BarChart3,
   Settings as SettingsIcon, Search, Bell, ChevronRight, ChevronDown, X, Plus,
@@ -15,6 +15,7 @@ import { loadState, syncDiff } from './db';
 import { supabase } from './supabaseClient';
 import { jsPDF } from 'jspdf';
 import { generateTimetableWithAI, isGrokConfigured } from './grok';
+import { generateForClasses, subjectsForClassSection, coverageForClass, isCombinedPair } from './solver';
 
 const T = {
   primary: '#1C3F6E',
@@ -152,6 +153,7 @@ function seedData() {
 }
 
 function computeConflicts(state) {
+  const subjectsById = new Map(state.subjects.map((s) => [s.id, s]));
   const bySlot = {};
   state.timetableEntries.forEach((e) => {
     const key = e.dayOrderId + '|' + e.periodId;
@@ -163,6 +165,9 @@ function computeConflicts(state) {
     for (let i = 0; i < entries.length; i++) {
       for (let j = i + 1; j < entries.length; j++) {
         const a = entries[i], b = entries[j];
+        // A common (multi-department) subject taught by the SAME faculty to different
+        // departments in the same slot is one combined lecture, not a double-booking.
+        if (isCombinedPair(a, b, subjectsById)) continue;
         if (a.facultyId && b.facultyId && a.facultyId === b.facultyId) {
           conflicts.push(makeConflict('faculty', a, b, state));
         }
@@ -1791,13 +1796,32 @@ function RoomsTab({ state, actions, highlightId = null }) {
   );
 }
 
+// Old code used `state.faculty.length + 1`, so after deleting any faculty the next new
+// one got an id that already existed -> duplicate primary key -> the insert failed and
+// was rolled back ("can't add / edit faculty"). Also it always used the FIRST department
+// instead of the selected one. Pick the first unused number for the chosen department.
+function nextFacultyId(state, deptId) {
+  const used = new Set(state.faculty.map((f) => f.id));
+  let n = state.faculty.filter((f) => f.departmentId === deptId).length + 1;
+  let id;
+  do { id = 'FAC-' + deptId + '-' + String(n++).padStart(3, '0'); } while (used.has(id));
+  return id;
+}
+
 function AddFacultyModal({ state, actions, onClose, editing = null }) {
+  const [showAllSubjects, setShowAllSubjects] = useState(false);
   const [form, setForm] = useState(() => editing ? { ...editing } : {
-    id: 'FAC-' + (state.departments[0]?.id || 'GEN') + '-' + String(state.faculty.length + 1).padStart(3, '0'),
+    id: nextFacultyId(state, state.departments[0]?.id || 'GEN'),
     name: '', departmentId: state.departments[0]?.id || '', designation: 'Assistant Professor',
     email: '', phone: '', subjectIds: [], maxWeeklyHours: 20, availability: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'],
   });
   const weekdays = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  // Real colleges have faculty teaching another department's / a common subject. The picker
+  // used to list ONLY the faculty's own department, so those links could never be made (or
+  // removed) from here. Own-department subjects + anything already selected are always shown;
+  // the toggle reveals every other subject.
+  const visibleSubjects = state.subjects.filter((s) =>
+    showAllSubjects || (s.departmentIds || []).includes(form.departmentId) || (form.subjectIds || []).includes(s.id));
 
   function submit() {
     if (!form.name || !form.email) { actions.toast('Enter a name and email.', 'critical'); return; }
@@ -1842,7 +1866,7 @@ function AddFacultyModal({ state, actions, onClose, editing = null }) {
         </Field>
         <Field label="Faculty name"><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Dr. Arun Kumar" /></Field>
         <Field label="Department">
-          <Select value={form.departmentId} onChange={(e) => setForm({ ...form, departmentId: e.target.value })}>
+          <Select value={form.departmentId} onChange={(e) => setForm(editing ? { ...form, departmentId: e.target.value } : { ...form, departmentId: e.target.value, id: nextFacultyId(state, e.target.value) })}>
             {state.departments.map((d) => <option key={d.id} value={d.id}>{d.id}</option>)}
           </Select>
         </Field>
@@ -1859,7 +1883,7 @@ function AddFacultyModal({ state, actions, onClose, editing = null }) {
       <div className="mt-3">
         <span className="mb-1 block text-xs font-semibold" style={{ color: T.muted }}>Subjects</span>
         <div className="flex flex-wrap gap-2">
-          {state.subjects.filter((s) => (s.departmentIds || []).includes(form.departmentId)).map((s) => {
+          {visibleSubjects.map((s) => {
             const checked = form.subjectIds.includes(s.id);
             return (
               <button
@@ -1868,11 +1892,14 @@ function AddFacultyModal({ state, actions, onClose, editing = null }) {
                 className="rounded-full border px-3 py-1 text-xs font-medium"
                 style={{ borderColor: checked ? T.primary : T.border, background: checked ? T.primaryTint : 'transparent', color: checked ? T.primary : T.ink }}
               >
-                {s.name}
+                {s.name}{(s.departmentIds || []).includes(form.departmentId) ? '' : ' (' + (s.departmentIds || []).join('/') + ')'}
               </button>
             );
           })}
-          {state.subjects.filter((s) => (s.departmentIds || []).includes(form.departmentId)).length === 0 && <p className="text-xs" style={{ color: T.muted }}>No subjects yet for this department.</p>}
+          {visibleSubjects.length === 0 && <p className="text-xs" style={{ color: T.muted }}>No subjects yet for this department.</p>}
+          <button type="button" onClick={() => setShowAllSubjects((v) => !v)} className="rounded-full border px-3 py-1 text-xs font-medium" style={{ borderColor: T.border, color: T.muted }}>
+            {showAllSubjects ? 'Only this department' : 'Show other departments\u2019 subjects'}
+          </button>
         </div>
       </div>
 
@@ -2056,6 +2083,11 @@ function CreateTimetable({ state, actions, conflicts }) {
   const [confirmed, setConfirmed] = useState(false);
   const [cell, setCell] = useState(null);
   const [aiBusy, setAiBusy] = useState(false);
+  // The AI call can take many seconds. `state`/`actions` captured when the button was
+  // clicked are stale by the time it returns, so writing them back could silently drop
+  // edits made meanwhile. Refs always point at the latest render.
+  const stateRef = useRef(state); stateRef.current = state;
+  const actionsRef = useRef(actions); actionsRef.current = actions;
 
   const classSection = useMemo(() => {
     if (!confirmed) return null;
@@ -2072,7 +2104,8 @@ function CreateTimetable({ state, actions, conflicts }) {
     setConfirmed(true);
   }
 
-  const deptSubjects = state.subjects.filter((s) => (s.departmentIds || []).includes(departmentId));
+  // Only this class's own YEAR's subjects (was: every subject of the department, all 4 years).
+  const deptSubjects = subjectsForClassSection(state, { departmentId, year });
   const entriesForClass = classSection ? state.timetableEntries.filter((e) => e.classSectionId === classSection.id) : [];
   const periodSlots = state.periods.filter((p) => p.type === 'period');
 
@@ -2089,6 +2122,48 @@ function CreateTimetable({ state, actions, conflicts }) {
   // (surfaces as "unknown room \u00d7N" in the toast) - same class of problem
   // as missing faculty, just on the room side.
   const roomsForDept = [...state.classrooms, ...state.labs].filter((r) => r.departmentId === departmentId);
+
+  // ---- Local auto-fill: no API, instant, can do a whole department in one click.
+  function summarizeUnplaced(unplaced) {
+    const names = new Map(state.subjects.map((s) => [s.id, s.name]));
+    const secs = new Map(state.classSections.map((c) => [c.id, c]));
+    return unplaced.slice(0, 3).map((u) => {
+      const c = secs.get(u.classSectionId);
+      return (c ? c.departmentId + ' ' + c.year + c.section + ' ' : '') + (names.get(u.subjectId) || u.subjectId) + ' (' + u.missing + 'h): ' + u.reason;
+    }).join(' | ') + (unplaced.length > 3 ? ' | +' + (unplaced.length - 3) + ' more' : '');
+  }
+
+  function autoFill(scope) {
+    if (!classSection) return;
+    const targets = scope === 'department'
+      ? state.classSections.filter((c) => c.departmentId === departmentId)
+      : [classSection];
+    const { entries, unplaced, stats } = generateForClasses({ state, classSections: targets });
+    if (entries.length > 0) {
+      const label = scope === 'department' ? departmentId + ' (' + targets.length + ' classes)' : departmentId + ' ' + year + section;
+      actions.persist(actions.logActivity(
+        { ...state, timetableEntries: [...state.timetableEntries, ...entries] },
+        'Auto-generated ' + entries.length + ' period(s) for ' + label,
+        { entityType: 'timetable', entityId: departmentId },
+      ));
+    }
+    if (stats.requiredHours === 0) { actions.toast('Nothing to fill \u2014 every subject already has its weekly hours.', 'success'); return; }
+    if (unplaced.length === 0) { actions.toast('Filled ' + entries.length + ' period(s) in ' + stats.ms + ' ms. No conflicts.', 'success'); return; }
+    actions.toast('Placed ' + entries.length + ' of ' + stats.requiredHours + ' period(s). Not placed \u2014 ' + summarizeUnplaced(unplaced), entries.length > 0 ? 'warn' : 'critical');
+  }
+
+  function clearClass() {
+    if (!classSection || entriesForClass.length === 0) return;
+    if (!window.confirm('Remove all ' + entriesForClass.length + ' period(s) of ' + departmentId + ' ' + year + section + '? This cannot be undone.')) return;
+    actions.persist(actions.logActivity(
+      { ...state, timetableEntries: state.timetableEntries.filter((e) => e.classSectionId !== classSection.id) },
+      'Timetable cleared for ' + departmentId + ' ' + year + section,
+      { entityType: 'timetable', entityId: departmentId },
+    ));
+    actions.toast('Class timetable cleared.');
+  }
+
+  const coverage = classSection ? coverageForClass(state, classSection, deptSubjects) : [];
 
   async function generateWithAI() {
     if (!classSection || aiBusy) return;
@@ -2108,11 +2183,13 @@ function CreateTimetable({ state, actions, conflicts }) {
       // remaining cells simply stay empty for manual entry rather than the
       // whole run being thrown away because *some* slots couldn't be placed.
       if (entries.length > 0) {
+        const liveState = stateRef.current;
+        const liveActions = actionsRef.current;
         const next = {
-          ...state,
-          timetableEntries: [...state.timetableEntries, ...entries],
+          ...liveState,
+          timetableEntries: [...liveState.timetableEntries, ...entries],
         };
-        actions.persist(actions.logActivity(next, 'AI generated ' + entries.length + ' slot(s) for ' + departmentId + ' ' + year + section, { entityType: 'timetable', entityId: departmentId }));
+        liveActions.persist(liveActions.logActivity(next, 'AI generated ' + entries.length + ' slot(s) for ' + departmentId + ' ' + year + section, { entityType: 'timetable', entityId: departmentId }));
       }
 
       if (entries.length === 0 && skipped.length === 0) {
@@ -2196,19 +2273,21 @@ function CreateTimetable({ state, actions, conflicts }) {
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
               <p className="ts-display text-sm font-semibold" style={{ color: T.ink }}>{departmentId} {'\u2013'} {year} {section} timetable grid</p>
               <div className="flex items-center gap-2">
-                {!isGrokConfigured() && (
-                  <span className="text-xs" style={{ color: T.warn }}>Add VITE_GROK_API_KEY to .env.local to enable AI generation</span>
+                <PrimaryButton icon={Sparkles} onClick={() => autoFill('class')} disabled={aiBusy}>Auto-fill this class</PrimaryButton>
+                <GhostButton onClick={() => autoFill('department')} disabled={aiBusy}>Auto-fill all {departmentId} classes</GhostButton>
+                {isGrokConfigured() && (
+                  <GhostButton onClick={generateWithAI} disabled={aiBusy}>
+                    {aiBusy ? 'Asking AI\u2026' : 'Ask AI for remaining cells'}
+                  </GhostButton>
                 )}
-                <PrimaryButton icon={Sparkles} onClick={generateWithAI} disabled={aiBusy || !isGrokConfigured()}>
-                  {aiBusy ? 'Generating\u2026' : 'Generate with AI'}
-                </PrimaryButton>
+                <GhostButton tone="critical" icon={Trash2} onClick={clearClass} disabled={aiBusy || entriesForClass.length === 0}>Clear</GhostButton>
               </div>
             </div>
             {subjectsMissingFaculty.length > 0 && (
               <div className="mb-3 flex items-start gap-2 rounded-lg border px-3 py-2 text-xs" style={{ borderColor: T.warn, background: T.warnTint, color: T.warn }}>
                 <AlertTriangle size={14} className="mt-0.5 shrink-0" />
                 <span>
-                  {subjectsMissingFaculty.length} subject(s) have no faculty assigned yet, so AI generation will always leave those periods empty:{' '}
+                  {subjectsMissingFaculty.length} subject(s) have no faculty assigned yet, so auto-fill will always leave those periods empty:{' '}
                   <strong>{subjectsMissingFaculty.map((s) => s.name).join(', ')}</strong>. Assign faculty to them in Master Data {'\u2192'} Subjects first for a fuller auto-fill.
                 </span>
               </div>
@@ -2217,7 +2296,7 @@ function CreateTimetable({ state, actions, conflicts }) {
               <div className="mb-3 flex items-start gap-2 rounded-lg border px-3 py-2 text-xs" style={{ borderColor: T.warn, background: T.warnTint, color: T.warn }}>
                 <AlertTriangle size={14} className="mt-0.5 shrink-0" />
                 <span>
-                  <strong>{departmentId}</strong> has no classrooms or labs in Master Data yet. AI generation will still fill subjects and faculty{' \u2014 '}room assignments will show as{' '}
+                  <strong>{departmentId}</strong> has no classrooms or labs in Master Data yet. Auto-fill will still place subjects and faculty{' \u2014 '}room assignments will show as{' '}
                   <strong>Not Assigned</strong> until you add rooms in Master Data{' \u2192 '}Classrooms & Labs.
                 </span>
               </div>
@@ -2274,6 +2353,15 @@ function CreateTimetable({ state, actions, conflicts }) {
                 ))}
               </tbody>
             </table>
+            {coverage.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-1.5">
+                {coverage.map((c) => (
+                  <span key={c.subjectId} className="rounded-full border px-2.5 py-0.5 text-xs" style={{ borderColor: c.scheduled === c.required ? T.success : c.scheduled > c.required ? T.critical : T.warn, color: c.scheduled === c.required ? T.success : c.scheduled > c.required ? T.critical : T.warn }}>
+                    {c.name} {c.scheduled}/{c.required}
+                  </span>
+                ))}
+              </div>
+            )}
           </Card>
 
           <div className="mt-5">
@@ -2320,8 +2408,10 @@ function AssignmentDrawer({ state, actions, cell, classSection, deptSubjects, de
   }
 
   function wouldConflict(entry) {
+    const subjectsById = new Map(state.subjects.map((s) => [s.id, s]));
     return state.timetableEntries.some((e) =>
       e.id !== entry.id && e.dayOrderId === entry.dayOrderId && e.periodId === entry.periodId &&
+      !isCombinedPair(e, entry, subjectsById) &&
       (e.facultyId === entry.facultyId || (entry.roomId && e.roomId === entry.roomId) || e.classSectionId === entry.classSectionId)
     );
   }

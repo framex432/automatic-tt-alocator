@@ -1,74 +1,39 @@
 // ---------------------------------------------------------------------------
-// AI-assisted timetable generation - turns one click into a filled grid.
+// OPTIONAL AI helper - now only a *second opinion* for cells the local solver
+// (src/solver.js) could not place. The primary generator makes zero API calls.
 //
-// ROOT CAUSE OF THE HTTP 401 THIS FILE USED TO PRODUCE:
-// This code has always called Groq's endpoint (api.groq.com) and a
-// Groq-hosted model (openai/gpt-oss-120b) - it does NOT call x.ai's actual
-// Grok API (api.x.ai). But every comment, error message, and the "Grok"
-// naming told you to get and check your key on console.x.ai. console.x.ai
-// keys and api.groq.com are two completely unrelated services with
-// incompatible key formats - a key from console.x.ai will be rejected by
-// Groq's server with HTTP 401 every single time, no matter how valid or
-// active that x.ai key is. That mismatch - not the key's validity - was the
-// actual bug. The fix below keeps the working endpoint/model (Groq, which is
-// what this code has always actually talked to) and corrects every place
-// that pointed you at the wrong provider's console.
+// This file talks to Groq (api.groq.com, OpenAI-compatible endpoint), NOT x.ai.
+// Get the key at console.groq.com/keys and put it in VITE_GROK_API_KEY
+// (name kept so existing .env files keep working).
 //
-// Groq exposes an OpenAI-compatible Chat Completions endpoint, so this is a
-// plain fetch() call, no SDK needed. The API key is read from
-// `VITE_GROK_API_KEY` (see .env.local / .env.example) - Vite only exposes env
-// vars prefixed with VITE_ to client code, same pattern already used for the
-// Supabase keys in src/supabaseClient.js. (The variable is still named
-// VITE_GROK_API_KEY, not VITE_GROQ_API_KEY, only to avoid touching every
-// other file/env reference that already uses that name - it holds a Groq
-// key from console.groq.com/keys.)
+// What was wrong before (and is fixed here):
+//   1. The prompt contained EVERY other booking in the college (`busyElsewhere`,
+//      ~40 tokens each). 30 classes x 36 cells = ~40k tokens -> blew Groq's
+//      tokens-per-minute cap / context and took ages. Now only the bookings of
+//      the *eligible faculty and rooms*, at the *still-empty cells*, are sent.
+//   2. Names, labels and repeated JSON keys were sent for every row. Now the
+//      payload is short ids, and the model answers with compact arrays.
+//   3. gpt-oss-120b is a reasoning model: with no limits it burned thousands of
+//      hidden tokens. We now cap output and set reasoning_effort: 'low'.
+//   4. fetch() had no timeout - a slow response froze the button. Every attempt
+//      now aborts after REQUEST_TIMEOUT_MS.
+//   5. The response validator now also enforces weeklyHours, faculty weekday
+//      availability, faculty maxWeeklyHours and combined classes (before, only
+//      the prompt "asked" for those and nothing checked).
 //
-// NOTE on security: like the Supabase anon key, this key ends up in the
-// browser bundle for anyone to read. That's an acceptable trade-off for a
-// small internal staff tool (same trade-off the README already documents for
-// auth), but if this app is ever exposed publicly, move this fetch behind a
-// small server/edge function that holds the real key instead.
+// NOTE on security: the key ships in the browser bundle. Fine for an internal
+// staff tool; for anything public move this fetch into a Supabase Edge Function.
 // ---------------------------------------------------------------------------
+import { isCombinedPair } from './solver';
 
 const GROK_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROK_MODEL = 'openai/gpt-oss-120b';
 
-// Groq's free tier caps tokens-per-minute (not requests-per-minute) - clicking
-// "Generate with AI" a few times in a row across departments can burn through
-// that budget and get a 429 back, even though the key/request are both fine.
-// Rather than surfacing that as a hard failure, retry automatically: Groq's
-// 429 body tells us almost exactly how long to wait ("Please try again in
-// 2.7375s"), so parse that (falling back to a Retry-After header, then a
-// plain default) and try again a few times before giving up for real.
-const MAX_429_RETRIES = 3;
+const REQUEST_TIMEOUT_MS = 45000;
+const MAX_429_RETRIES = 2;
 const DEFAULT_RETRY_MS = 5000;
-const MAX_RETRY_MS = 20000;
-
-async function fetchWithRetry(url, options, onRetry, attempt = 0) {
-  const response = await fetch(url, options);
-  if (response.status !== 429 || attempt >= MAX_429_RETRIES) return response;
-
-  let waitMs = DEFAULT_RETRY_MS;
-  const retryAfterHeader = response.headers.get('retry-after');
-  if (retryAfterHeader && !Number.isNaN(Number(retryAfterHeader))) {
-    waitMs = Math.ceil(Number(retryAfterHeader) * 1000);
-  } else {
-    // Read the body from a clone - the original response still needs to be
-    // readable by the normal error-handling path below if this was the last
-    // attempt, and a Response body can only be consumed once.
-    try {
-      const body = await response.clone().json();
-      const msg = body?.error?.message || (typeof body?.error === 'string' ? body.error : '') || '';
-      const match = msg.match(/try again in ([\d.]+)s/i);
-      if (match) waitMs = Math.ceil(parseFloat(match[1]) * 1000);
-    } catch { /* not JSON, or no hint in it - use the default */ }
-  }
-  waitMs = Math.min(waitMs, MAX_RETRY_MS) + 300; // small buffer so we don't race Groq's own clock
-
-  onRetry?.(attempt + 1, waitMs);
-  await new Promise((resolve) => setTimeout(resolve, waitMs));
-  return fetchWithRetry(url, options, onRetry, attempt + 1);
-}
+const MAX_RETRY_MS = 15000;
+const MAX_OUTPUT_TOKENS = 4000;
 
 function apiKey() {
   return import.meta.env.VITE_GROK_API_KEY;
@@ -78,96 +43,142 @@ export function isGrokConfigured() {
   return Boolean(apiKey());
 }
 
+async function fetchOnce(url, options) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } catch (err) {
+    if (err?.name === 'AbortError') throw new Error('timed out after ' + REQUEST_TIMEOUT_MS / 1000 + 's');
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchWithRetry(url, options, onRetry, attempt = 0) {
+  const response = await fetchOnce(url, options);
+  if (response.status !== 429 || attempt >= MAX_429_RETRIES) return response;
+
+  let waitMs = DEFAULT_RETRY_MS;
+  const retryAfter = response.headers.get('retry-after');
+  if (retryAfter && !Number.isNaN(Number(retryAfter))) {
+    waitMs = Math.ceil(Number(retryAfter) * 1000);
+  } else {
+    try {
+      const body = await response.clone().json();
+      const msg = body?.error?.message || (typeof body?.error === 'string' ? body.error : '') || '';
+      const match = msg.match(/try again in ([\d.]+)s/i);
+      if (match) waitMs = Math.ceil(parseFloat(match[1]) * 1000);
+    } catch { /* no hint - use default */ }
+  }
+  waitMs = Math.min(waitMs, MAX_RETRY_MS) + 300;
+  onRetry?.(attempt + 1, waitMs);
+  await new Promise((resolve) => setTimeout(resolve, waitMs));
+  return fetchWithRetry(url, options, onRetry, attempt + 1);
+}
+
 // ---------------------------------------------------------------------------
-// Builds the instructions + the exact slice of master data Grok needs to fill
-// one class section's grid: its subjects (with weekly-hour targets and which
-// faculty are eligible to teach each one), the day-order/period layout, the
-// rooms it can use, and every OTHER timetable entry already on the books
-// (any department) so Grok doesn't double-book a faculty member or a room.
+// Compact prompt: only what the model needs to fill THIS class's empty cells.
 // ---------------------------------------------------------------------------
-function buildPrompt({ state, departmentId, classSection, deptSubjects, periodSlots, existingEntriesForClass, allOtherEntries }) {
-  const subjectsPayload = deptSubjects.map((s) => {
-    const eligibleFaculty = state.faculty.filter((f) => s.facultyIds.includes(f.id));
+export function buildPrompt({ state, departmentId, classSection, deptSubjects, periodSlots, existingEntriesForClass, allOtherEntries }) {
+  const cell = (d, p) => d + ':' + p;
+  const filled = new Set(existingEntriesForClass.map((e) => cell(e.dayOrderId, e.periodId)));
+  const free = [];
+  for (const d of state.dayOrders) for (const p of periodSlots) if (!filled.has(cell(d.id, p.id))) free.push(cell(d.id, p.id));
+  const freeSet = new Set(free);
+
+  // distinct booked slots per faculty across the whole college (real weekly load)
+  const loadOf = new Map();
+  [...existingEntriesForClass, ...allOtherEntries].forEach((e) => {
+    if (!e.facultyId) return;
+    if (!loadOf.has(e.facultyId)) loadOf.set(e.facultyId, new Set());
+    loadOf.get(e.facultyId).add(cell(e.dayOrderId, e.periodId));
+  });
+
+  const subjects = [];
+  const facultyIds = new Set();
+  for (const s of deptSubjects) {
+    const done = existingEntriesForClass.filter((e) => e.subjectId === s.id).length;
+    const need = (Number(s.weeklyHours) || 0) - done;
+    const fac = (s.facultyIds || []).filter((id) => state.faculty.some((f) => f.id === id));
+    if (need <= 0 || fac.length === 0) continue; // nothing to place / nobody to teach it
+    fac.forEach((id) => facultyIds.add(id));
+    subjects.push({ id: s.id, t: s.type === 'Lab' ? 'L' : 'T', need, fac });
+  }
+
+  const faculty = state.faculty.filter((f) => facultyIds.has(f.id)).map((f) => {
+    const off = state.dayOrders.filter((d) => Array.isArray(f.availability) && !f.availability.includes(d.actualDay)).map((d) => d.id);
+    const cap = Number(f.maxWeeklyHours);
     return {
-      subjectId: s.id,
-      name: s.name,
-      type: s.type, // 'Theory' | 'Lab'
-      weeklyHours: s.weeklyHours,
-      alreadyScheduledHours: existingEntriesForClass.filter((e) => e.subjectId === s.id).length,
-      eligibleFaculty: eligibleFaculty.map((f) => ({ facultyId: f.id, name: f.name, maxWeeklyHours: f.maxWeeklyHours, availability: f.availability })),
+      id: f.id,
+      left: Number.isFinite(cap) ? Math.max(0, cap - (loadOf.get(f.id)?.size || 0)) : 99,
+      ...(off.length ? { off } : {}),
     };
-  }).filter((s) => s.eligibleFaculty.length > 0); // can't schedule a subject with nobody to teach it
+  });
 
   const rooms = [...state.classrooms, ...state.labs]
     .filter((r) => r.departmentId === departmentId)
-    .map((r) => ({ roomId: r.id, name: r.name, type: r.type }));
+    .map((r) => ({ id: r.id, t: r.type === 'lab' ? 'lab' : 'room' }));
+  const roomIds = new Set(rooms.map((r) => r.id));
 
-  const dayOrders = state.dayOrders.map((d) => ({ dayOrderId: d.id, label: d.label, actualDay: d.actualDay }));
-  const periods = periodSlots.map((p) => ({ periodId: p.id, label: p.label }));
+  // Only bookings that can actually clash: eligible faculty / this dept's rooms,
+  // and only at cells that are still empty for this class.
+  const busyF = {};
+  const busyR = {};
+  for (const e of allOtherEntries) {
+    const c = cell(e.dayOrderId, e.periodId);
+    if (!freeSet.has(c)) continue;
+    if (e.facultyId && facultyIds.has(e.facultyId)) (busyF[e.facultyId] ||= []).push(c);
+    if (e.roomId && roomIds.has(e.roomId)) (busyR[e.roomId] ||= []).push(c);
+  }
 
-  const busy = allOtherEntries.map((e) => ({
-    dayOrderId: e.dayOrderId, periodId: e.periodId, facultyId: e.facultyId, roomId: e.roomId,
-  }));
-
-  const alreadyFilled = existingEntriesForClass.map((e) => ({ dayOrderId: e.dayOrderId, periodId: e.periodId }));
-
-  const system = `You are a university timetable scheduling engine. You ONLY output strict JSON, nothing else - no markdown fences, no commentary, no explanations before or after.
-
-Given a class section's subjects, the day-order/period grid, the rooms available, and a list of slots that are already busy elsewhere in the college, produce a JSON array of timetable entries that fills EVERY empty (dayOrderId, periodId) cell for this class section.
-
-Hard rules:
-1. Never assign a (dayOrderId, periodId) pair that already appears in "alreadyFilled" - those cells are taken by an existing manual entry and must be left alone (do not include them in your output at all).
-2. Never assign a facultyId or roomId to a (dayOrderId, periodId) that already appears in "busyElsewhere" with that same facultyId or roomId - that faculty member or room is already teaching another class at that exact time.
-3. Never output two of your own entries with the same (dayOrderId, periodId) - one subject per period for this class.
-4. Only use a facultyId that is listed under that subject's "eligibleFaculty".
-5. Try to hit each subject's "weeklyHours" total (counting "alreadyScheduledHours" already on the books) as closely as possible across the whole week, spread across different day orders rather than stacked back-to-back on one day, but NEVER exceed it.
-6. type: "Lab" subjects should use a room whose type is "lab" when one is available; type: "Theory" subjects should use a room whose type is "classroom" when one is available. If no room of the matching type exists in the given room list, pick any available room from the list rather than skip the subject.
-7. NEVER invent a roomId, facultyId, or subjectId that is not present in the lists given to you. A room is OPTIONAL: if the "rooms" list is empty, or none of the available rooms are free at that slot, set "roomId" to null and still place the entry (subject/faculty scheduling must never be blocked by a missing room) - do not guess or invent a roomId under any circumstances.
-8. It is fine, and expected, to leave a cell empty (omit it) if no subject/faculty combination can be legally placed there (e.g. no eligible faculty is free).
-
-Output format - a JSON array only, each item exactly:
-{"dayOrderId": string, "periodId": string, "subjectId": string, "facultyId": string, "roomId": string | null, "type": "theory" | "lab"}`;
+  const system = `You are a timetable scheduling engine. Reply with ONE JSON array and nothing else (no markdown, no prose).
+Each item: ["<day>","<period>","<subjectId>","<facultyId>","<roomId or null>"]  (day/period are the two halves of a "free" cell "DAY:PERIOD").
+Rules:
+1. Use only cells listed in "free", each at most once.
+2. A subject may be placed at most "need" times. subject.fac lists the only allowed faculty. Prefer ONE faculty per subject.
+3. Never use a faculty at a cell listed for them in busyF, never a room at a cell listed in busyR, never a faculty on a day in their "off" list.
+4. A faculty can be used at most "left" times in total.
+5. Subjects with t="L" (lab) need 2 (or 3) CONSECUTIVE periods on the same day, in a room with t="lab" if any. Theory subjects use t="room" rooms. If no room fits, use null.
+6. Spread each subject over different days. Leaving cells empty is fine. Never invent ids.`;
 
   const user = JSON.stringify({
-    department: departmentId,
-    classSection: { year: classSection.year, section: classSection.section, batch: classSection.batch },
-    dayOrders,
-    periods,
-    rooms,
-    subjects: subjectsPayload,
-    alreadyFilled,
-    busyElsewhere: busy,
+    cls: departmentId + '-' + classSection.year + '-' + classSection.section,
+    free, subjects, faculty, rooms, busyF, busyR,
   });
-
   return { system, user };
 }
 
 function extractJsonArray(text) {
-  // Grok is instructed to return raw JSON, but strip ```json fences defensively
-  // in case the model wraps it anyway.
   const cleaned = text.trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
   const start = cleaned.indexOf('[');
   const end = cleaned.lastIndexOf(']');
-  if (start === -1 || end === -1 || end < start) {
-    throw new Error('Grok did not return a JSON array.');
-  }
+  if (start === -1 || end === -1 || end < start) throw new Error('No JSON array in response.');
   return JSON.parse(cleaned.slice(start, end + 1));
 }
 
+// accepts the compact tuple form AND the old object form
+function normalizeItem(item) {
+  if (Array.isArray(item)) {
+    const [dayOrderId, periodId, subjectId, facultyId, roomId] = item;
+    return { dayOrderId, periodId, subjectId, facultyId, roomId };
+  }
+  return item || {};
+}
+
 // ---------------------------------------------------------------------------
-// Calls Grok and returns a validated list of NEW timetable entries (ready to
-// merge into state.timetableEntries) for one class section. Throws with a
-// human-readable message on any failure - the caller is expected to toast it.
+// Calls the model and returns validated NEW entries for one class section.
+// Same signature as before. Throws with a human-readable message on failure.
 // ---------------------------------------------------------------------------
 export async function generateTimetableWithAI({ state, departmentId, classSection, deptSubjects, periodSlots, onRetry }) {
   const key = apiKey();
   if (!key) {
-    throw new Error('No Groq API key found. Add VITE_GROK_API_KEY to .env.local (get a key at console.groq.com/keys - this calls Groq, not x.ai) and restart the dev server.');
+    throw new Error('No Groq API key found. Add VITE_GROK_API_KEY to .env.local (key from console.groq.com/keys) and restart the dev server.');
   }
 
   const existingEntriesForClass = state.timetableEntries.filter((e) => e.classSectionId === classSection.id);
   const allOtherEntries = state.timetableEntries.filter((e) => e.classSectionId !== classSection.id);
-
   const { system, user } = buildPrompt({ state, departmentId, classSection, deptSubjects, periodSlots, existingEntriesForClass, allOtherEntries });
 
   let response;
@@ -178,20 +189,16 @@ export async function generateTimetableWithAI({ state, departmentId, classSectio
       body: JSON.stringify({
         model: GROK_MODEL,
         temperature: 0.2,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
+        max_completion_tokens: MAX_OUTPUT_TOKENS,
+        reasoning_effort: 'low',
+        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
       }),
     }, onRetry);
   } catch (err) {
-    throw new Error('Could not reach Grok (' + (err?.message || 'network error') + ').');
+    throw new Error('Could not reach the AI service (' + (err?.message || 'network error') + ').');
   }
 
   if (!response.ok) {
-    // Groq's error body isn't always shaped like OpenAI's `{ error: { message } }` -
-    // it's often flat: `{ code: "...", error: "some string" }`. Try every shape
-    // instead of assuming one, so the real reason actually reaches the toast.
     let detail = '';
     try {
       const body = await response.json();
@@ -199,78 +206,91 @@ export async function generateTimetableWithAI({ state, departmentId, classSectio
       if (!detail && body) detail = JSON.stringify(body).slice(0, 300);
       // eslint-disable-next-line no-console
       console.error('Groq API error response:', body);
-    } catch { /* body wasn't JSON at all */ }
+    } catch { /* not JSON */ }
     if (response.status === 401 || response.status === 403) {
-      throw new Error('Groq rejected the API key (HTTP ' + response.status + '). This calls console.groq.com, not x.ai/console.x.ai \u2014 make sure VITE_GROK_API_KEY in .env.local is a key generated at console.groq.com/keys, is pasted without extra spaces/quotes, and is active, then restart the dev server.');
+      throw new Error('Groq rejected the API key (HTTP ' + response.status + '). Use a key from console.groq.com/keys (not x.ai), no extra spaces/quotes, then restart the dev server.');
     }
-    if (response.status === 404) {
-      throw new Error('Groq model "' + GROK_MODEL + '" was not found for this account (HTTP 404). ' + (detail || 'Check the model is available on your Groq plan at console.groq.com.'));
-    }
-    if (response.status === 429) {
-      throw new Error('Groq is still rate-limited after ' + MAX_429_RETRIES + ' automatic retries. Wait a bit longer and try again, or reduce how often "Generate with AI" is clicked back-to-back across departments.');
-    }
-    throw new Error('Groq API error ' + response.status + (detail ? ': ' + detail : ' (no further detail in the response body).'));
+    if (response.status === 404) throw new Error('Groq model "' + GROK_MODEL + '" not found for this account (HTTP 404). ' + detail);
+    if (response.status === 413) throw new Error('Request too large for the AI service (HTTP 413). Use the local Auto-fill instead.');
+    if (response.status === 429) throw new Error('Groq is still rate-limited after ' + MAX_429_RETRIES + ' retries. Wait a minute and try again.');
+    throw new Error('Groq API error ' + response.status + (detail ? ': ' + detail : ''));
   }
 
   const data = await response.json();
   const text = data?.choices?.[0]?.message?.content;
-  if (!text) throw new Error('Grok returned an empty response.');
+  if (!text) throw new Error('The AI returned an empty response (it may have run out of output tokens).');
 
   let raw;
-  try {
-    raw = extractJsonArray(text);
-  } catch {
-    throw new Error('Could not parse Grok\u2019s response as JSON.');
-  }
+  try { raw = extractJsonArray(text); } catch { throw new Error('Could not parse the AI response as JSON.'); }
 
-  // --- Validate every entry against real master data before it ever touches
-  // state - an AI response is untrusted input, same as a form submission.
+  // ---- validate every item against real master data (AI output is untrusted input)
   const validPeriodIds = new Set(periodSlots.map((p) => p.id));
-  const validDayOrderIds = new Set(state.dayOrders.map((d) => d.id));
+  const dayById = new Map(state.dayOrders.map((d) => [d.id, d]));
   const subjectsById = new Map(deptSubjects.map((s) => [s.id, s]));
+  const allSubjectsById = new Map(state.subjects.map((s) => [s.id, s]));
   const facultyById = new Map(state.faculty.map((f) => [f.id, f]));
   const roomById = new Map([...state.classrooms, ...state.labs].map((r) => [r.id, r]));
   const filledCells = new Set(existingEntriesForClass.map((e) => e.dayOrderId + '|' + e.periodId));
 
-  const busyFaculty = new Set(allOtherEntries.map((e) => e.dayOrderId + '|' + e.periodId + '|' + e.facultyId));
-  const busyRoom = new Set(allOtherEntries.map((e) => e.dayOrderId + '|' + e.periodId + '|' + e.roomId));
+  const slotEntries = new Map(); // 'd|p' -> entries booked elsewhere
+  allOtherEntries.forEach((e) => {
+    const k = e.dayOrderId + '|' + e.periodId;
+    if (!slotEntries.has(k)) slotEntries.set(k, []);
+    slotEntries.get(k).push(e);
+  });
+  const facSlots = new Map();
+  [...existingEntriesForClass, ...allOtherEntries].forEach((e) => {
+    if (!e.facultyId) return;
+    if (!facSlots.has(e.facultyId)) facSlots.set(e.facultyId, new Set());
+    facSlots.get(e.facultyId).add(e.dayOrderId + '|' + e.periodId);
+  });
+  const hoursDone = new Map();
+  existingEntriesForClass.forEach((e) => hoursDone.set(e.subjectId, (hoursDone.get(e.subjectId) || 0) + 1));
 
   const seenCells = new Set();
   const skipped = [];
   const entries = [];
 
-  for (const item of Array.isArray(raw) ? raw : []) {
-    const { dayOrderId, periodId, subjectId, facultyId, type } = item || {};
-    // Room is optional: treat any falsy value (null, undefined, '', 0) as "no room
-    // assigned" rather than a roomId to look up - only validate it as a real room
-    // reference when Grok actually gave us one.
-    const roomId = item && item.roomId ? item.roomId : null;
+  for (const rawItem of Array.isArray(raw) ? raw : []) {
+    const { dayOrderId, periodId, subjectId, facultyId } = normalizeItem(rawItem);
+    const roomId = normalizeItem(rawItem).roomId || null;
     const cellKey = dayOrderId + '|' + periodId;
     const subject = subjectsById.get(subjectId);
     const faculty = facultyById.get(facultyId);
-    const room = roomId ? roomById.get(roomId) : null;
+    const day = dayById.get(dayOrderId);
+    const probe = { classSectionId: classSection.id, departmentId, subjectId, facultyId };
 
     const reasons = [];
-    if (!validDayOrderIds.has(dayOrderId) || !validPeriodIds.has(periodId)) reasons.push('unknown day/period');
+    if (!day || !validPeriodIds.has(periodId)) reasons.push('unknown day/period');
     if (filledCells.has(cellKey)) reasons.push('cell already filled');
-    if (seenCells.has(cellKey)) reasons.push('duplicate cell from Grok');
+    if (seenCells.has(cellKey)) reasons.push('duplicate cell from AI');
     if (!subject) reasons.push('unknown subject');
     if (!faculty || !subject?.facultyIds.includes(facultyId)) reasons.push('faculty not eligible for subject');
-    if (roomId && !room) reasons.push('unknown room');
-    if (busyFaculty.has(dayOrderId + '|' + periodId + '|' + facultyId)) reasons.push('faculty double-booked');
-    if (roomId && busyRoom.has(dayOrderId + '|' + periodId + '|' + roomId)) reasons.push('room double-booked');
-
-    if (reasons.length) {
-      skipped.push({ item, reasons });
-      continue;
+    if (roomId && !roomById.has(roomId)) reasons.push('unknown room');
+    if (subject && (hoursDone.get(subjectId) || 0) >= (Number(subject.weeklyHours) || 0)) reasons.push('subject weekly hours exceeded');
+    if (faculty && day && Array.isArray(faculty.availability) && !faculty.availability.includes(day.actualDay)) reasons.push('faculty unavailable that day');
+    if (faculty) {
+      const cap = Number(faculty.maxWeeklyHours);
+      const used = facSlots.get(facultyId);
+      if (Number.isFinite(cap) && !(used && used.has(cellKey)) && (used ? used.size : 0) >= cap) reasons.push('faculty max weekly hours reached');
+    }
+    for (const e of slotEntries.get(cellKey) || []) {
+      const combined = isCombinedPair(e, probe, allSubjectsById);
+      if (e.facultyId === facultyId && !combined) reasons.push('faculty double-booked');
+      if (roomId && e.roomId === roomId && !combined) reasons.push('room double-booked');
     }
 
+    if (reasons.length) { skipped.push({ item: rawItem, reasons: [...new Set(reasons)] }); continue; }
+
     seenCells.add(cellKey);
+    hoursDone.set(subjectId, (hoursDone.get(subjectId) || 0) + 1);
+    if (!facSlots.has(facultyId)) facSlots.set(facultyId, new Set());
+    facSlots.get(facultyId).add(cellKey);
     entries.push({
       id: 'TT-' + Math.random().toString(36).slice(2, 9),
       departmentId, classSectionId: classSection.id,
       dayOrderId, periodId, subjectId, facultyId, roomId,
-      type: type === 'lab' ? 'lab' : 'theory',
+      type: subject.type === 'Lab' ? 'lab' : 'theory',
     });
   }
 
