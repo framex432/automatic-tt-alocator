@@ -14,8 +14,9 @@ import {
 import { loadState, syncDiff } from './db';
 import { supabase } from './supabaseClient';
 import { jsPDF } from 'jspdf';
-import { generateTimetableWithAI, isGrokConfigured } from './grok';
-import { generateForClasses, subjectsForClassSection, coverageForClass, isCombinedPair } from './solver';
+import { generateTimetableWithAI, parseChangeRequest, isGrokConfigured } from './grok';
+import { generateForClasses, planForClassSection, findOrphanEntries, coverageForClass, isCombinedPair } from './solver';
+import { applyChangeOps } from './editor';
 
 const T = {
   primary: '#1C3F6E',
@@ -146,6 +147,7 @@ function seedData() {
   return {
     college: { name: 'Sir Issac Newton College of Engineering and Technology', academicYear: '2026\u20132027', workingDays: 'Monday \u2013 Saturday', numPeriods: 6 },
     departments, dayOrders, periods, faculty, subjects, classrooms, labs, classSections, timetableEntries,
+    classAssignments: [],
     activityLog: [
       { id: uid('ACT'), text: 'New faculty added: Dr. Arun Kumar', ts: Date.now() - 1000 * 60 * 60 },
     ],
@@ -588,7 +590,9 @@ function TimeSyncAIInner() {
       // the database correctly refuses) would keep showing as "deleted" on screen
       // even though it's still there in Supabase, until the next reload.
       setState(prev);
-      const friendly = /foreign key|violates|restrict/i.test(err?.message || '')
+      const friendly = /class_assignments/i.test(err?.message || '') && /find the table|does not exist|schema cache/i.test(err?.message || '')
+        ? 'The class-allocation table is missing. Run supabase-migration-class-assignments.sql in the Supabase SQL editor, then reload.'
+        : /foreign key|violates|restrict/i.test(err?.message || '')
         ? 'That can\u2019t be removed while other records still depend on it. Reassign or delete those first, then try again.'
         : 'Change could not be saved: ' + (err?.message || 'unknown error') + '. Nothing was changed.';
       toast(friendly, 'critical');
@@ -1281,7 +1285,33 @@ function DepartmentCard({ d, state, actions, highlightId }) {
   const realClassSections = deptClassSections.filter((c) => state.timetableEntries.some((e) => e.classSectionId === c.id));
   const staleClassSections = deptClassSections.filter((c) => !state.timetableEntries.some((e) => e.classSectionId === c.id));
   const clsCount = realClassSections.length;
+  const totalClasses = deptClassSections.length;
   const [flashing, ref] = useFlashHighlight(highlightId, d.id);
+  const [showClasses, setShowClasses] = useState(false);
+
+  // Classes of this department, I-year first, then by section.
+  const sortedClasses = [...deptClassSections].sort((a, b) =>
+    (YEAR_OPTIONS.indexOf(a.year) - YEAR_OPTIONS.indexOf(b.year)) || String(a.section).localeCompare(String(b.section)));
+
+  function deleteClass(c) {
+    const periods = state.timetableEntries.filter((e) => e.classSectionId === c.id).length;
+    const allocated = (state.classAssignments || []).filter((a) => a.classSectionId === c.id).length;
+    const label = d.id + ' ' + c.year + '-' + c.section;
+    const extra = [periods > 0 && periods + ' timetable period(s)', allocated > 0 && allocated + ' staff allocation(s)'].filter(Boolean).join(' and ');
+    if (!window.confirm('Delete class ' + label + '?' + (extra ? ' Its ' + extra + ' will be deleted too.' : '') + ' This cannot be undone.')) return;
+    actions.persist(actions.logActivity(
+      {
+        ...state,
+        classSections: state.classSections.filter((x) => x.id !== c.id),
+        timetableEntries: state.timetableEntries.filter((e) => e.classSectionId !== c.id),
+        classAssignments: (state.classAssignments || []).filter((a) => a.classSectionId !== c.id),
+      },
+      'Class removed: ' + label,
+      { entityType: 'department', entityId: d.id },
+    ));
+    actions.toast('Class ' + label + ' deleted.', 'success');
+  }
+
   return (
     <Card
       ref={ref}
@@ -1306,7 +1336,11 @@ function DepartmentCard({ d, state, actions, highlightId }) {
             // same save as the delete, so they never dangle behind and never come back
             // to block a future department delete either.
             const next = staleClassSections.length
-              ? { ...state, classSections: state.classSections.filter((c) => c.departmentId !== d.id) }
+              ? {
+                  ...state,
+                  classSections: state.classSections.filter((c) => c.departmentId !== d.id),
+                  classAssignments: (state.classAssignments || []).filter((a) => !staleClassSections.some((c) => c.id === a.classSectionId)),
+                }
               : state;
             actions.persist(actions.logActivity({ ...next, departments: next.departments.filter((x) => x.id !== d.id) }, 'Department removed: ' + d.name));
             actions.toast('Department removed.');
@@ -1320,14 +1354,168 @@ function DepartmentCard({ d, state, actions, highlightId }) {
       <div className="mt-3 flex gap-4 text-xs" style={{ color: T.muted }}>
         <span>{facCount} faculty</span>
         <span>{subCount} subjects</span>
-        <span>{clsCount} classes</span>
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); setShowClasses((v) => !v); }}
+          className="inline-flex items-center gap-1 rounded-md px-1.5 font-semibold underline decoration-dotted underline-offset-2 hover:bg-gray-100"
+          style={{ color: T.primary }}
+          title="Show / hide the classes of this department"
+        >
+          {totalClasses} classes
+          {showClasses ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+        </button>
       </div>
+
+      {showClasses && (
+        <div className="mt-3 border-t pt-2" style={{ borderColor: T.border }} onClick={(e) => e.stopPropagation()}>
+          {sortedClasses.length === 0 ? (
+            <p className="py-2 text-xs" style={{ color: T.muted }}>No classes yet. Use "Add classes to an existing department" below.</p>
+          ) : (
+            <ul className="space-y-1">
+              {sortedClasses.map((c) => {
+                const periods = state.timetableEntries.filter((e) => e.classSectionId === c.id).length;
+                const allocated = (state.classAssignments || []).filter((a) => a.classSectionId === c.id).length;
+                return (
+                  <li key={c.id} className="flex items-center justify-between gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-gray-50">
+                    <div>
+                      <span className="font-semibold" style={{ color: T.ink }}>{c.year} year {'\u2013'} Section {c.section}</span>
+                      <span className="ml-2" style={{ color: T.muted }}>
+                        {c.batch ? c.batch + ' \u00b7 ' : ''}{periods} period{periods === 1 ? '' : 's'} scheduled{allocated ? ' \u00b7 ' + allocated + ' subject(s) allocated' : ''}
+                      </span>
+                    </div>
+                    <button type="button" onClick={() => deleteClass(c)} className="rounded-md p-1 hover:bg-gray-100" title={'Delete ' + d.id + ' ' + c.year + '-' + c.section}>
+                      <Trash2 size={13} color={T.critical} />
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      )}
     </Card>
+  );
+}
+
+const YEAR_OPTIONS = ['I', 'II', 'III', 'IV'];
+const SECTION_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F'];
+
+// Build the class_sections rows for a department: every chosen year x sections A..N.
+// Rows that already exist (same department + year + section) are skipped, so this is
+// safe to run again later to add "C" to a department that already has A and B.
+function buildClassSections(state, departmentId, years, sectionCount) {
+  const parsed = parseInt(String(state.college?.academicYear || '').slice(0, 4), 10);
+  const start = Number.isFinite(parsed) ? parsed : new Date().getFullYear();
+  const out = [];
+  YEAR_OPTIONS.filter((y) => years.includes(y)).forEach((year) => {
+    const yi = YEAR_OPTIONS.indexOf(year);
+    for (let i = 0; i < sectionCount; i++) {
+      const section = SECTION_LETTERS[i];
+      if (state.classSections.some((c) => c.departmentId === departmentId && c.year === year && c.section === section)) continue;
+      // I year joined this academic year, II year one year earlier, ...  Semester = odd semester of that year.
+      out.push({ id: uid('CLS'), departmentId, batch: (start - yi) + '\u2013' + (start - yi + 4), year, semester: yi * 2 + 1, section, roomId: null });
+    }
+  });
+  return out;
+}
+
+// Years + "how many sections" chooser. Ticking a letter means "A up to this one":
+// tick C -> A, B, C. Tick the last selected letter again to drop it.
+function ClassSectionPicker({ years, onYears, count, onCount }) {
+  const chip = (on) => ({ borderColor: on ? T.primary : T.border, background: on ? T.primaryTint : 'transparent', color: on ? T.primary : T.ink });
+  return (
+    <div className="space-y-3">
+      <div>
+        <span className="mb-1 block text-xs font-semibold" style={{ color: T.muted }}>Years to create</span>
+        <div className="flex flex-wrap gap-2">
+          {YEAR_OPTIONS.map((y) => {
+            const on = years.includes(y);
+            return (
+              <button key={y} type="button" onClick={() => onYears(on ? years.filter((x) => x !== y) : [...years, y])}
+                className="rounded-full border px-3 py-1 text-xs font-medium" style={chip(on)}>
+                {on ? '\u2713 ' : ''}{y} year
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div>
+        <span className="mb-1 block text-xs font-semibold" style={{ color: T.muted }}>Sections {'\u2014'} tick up to the last one you need</span>
+        <div className="flex flex-wrap gap-2">
+          {SECTION_LETTERS.map((L, i) => {
+            const on = i < count;
+            return (
+              <button key={L} type="button" onClick={() => onCount(i === count - 1 ? Math.max(1, i) : i + 1)}
+                className="h-8 w-8 rounded-lg border text-sm font-semibold" style={chip(on)}>
+                {L}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ClassPreview({ deptId, years, count, existing }) {
+  const labels = [];
+  YEAR_OPTIONS.filter((y) => years.includes(y)).forEach((y) => {
+    for (let i = 0; i < count; i++) labels.push(deptId + ' ' + y + '-' + SECTION_LETTERS[i]);
+  });
+  if (labels.length === 0) return <p className="text-xs" style={{ color: T.warn }}>Pick at least one year.</p>;
+  return (
+    <p className="text-xs" style={{ color: T.muted }}>
+      {labels.length - existing} new class(es) will be created{existing > 0 ? ' (' + existing + ' already exist and are kept)' : ''}: {labels.slice(0, 12).join(', ')}{labels.length > 12 ? ' \u2026 +' + (labels.length - 12) + ' more' : ''}
+    </p>
   );
 }
 
 function DepartmentsTab({ state, actions, highlightId = null }) {
   const [form, setForm] = useState({ id: '', name: '' });
+  const [divide, setDivide] = useState(false);
+  const [years, setYears] = useState([...YEAR_OPTIONS]);
+  const [count, setCount] = useState(2);
+
+  // second card: add classes to a department that already exists (e.g. create CSE-B later)
+  const [extraDept, setExtraDept] = useState(state.departments[0]?.id || '');
+  const [extraYears, setExtraYears] = useState([...YEAR_OPTIONS]);
+  const [extraCount, setExtraCount] = useState(2);
+  const dept = extraDept || state.departments[0]?.id || '';
+
+  const alreadyExisting = (deptId, ys, n) => YEAR_OPTIONS.filter((y) => ys.includes(y)).reduce((sum, y) => {
+    for (let i = 0; i < n; i++) if (state.classSections.some((c) => c.departmentId === deptId && c.year === y && c.section === SECTION_LETTERS[i])) sum++;
+    return sum;
+  }, 0);
+
+  function addDepartment() {
+    const id = form.id.trim().toUpperCase().replace(/\s+/g, '-');
+    const name = form.name.trim();
+    if (!id || !name) { actions.toast('Fill in both the code and the name.', 'critical'); return; }
+    if (state.departments.some((d) => d.id === id)) { actions.toast('A department with code ' + id + ' already exists.', 'critical'); return; }
+    if (divide && years.length === 0) { actions.toast('Pick at least one year for the classes.', 'critical'); return; }
+    const newSections = divide ? buildClassSections(state, id, years, count) : [];
+    actions.persist(actions.logActivity(
+      { ...state, departments: [...state.departments, { id, name }], classSections: [...state.classSections, ...newSections] },
+      'Department added: ' + name + (newSections.length ? ' (+' + newSections.length + ' classes)' : ''),
+      { entityType: 'department', entityId: id },
+    ));
+    setForm({ id: '', name: '' });
+    actions.toast('Department added' + (newSections.length ? ' with ' + newSections.length + ' classes.' : '.'), 'success');
+  }
+
+  function addClassesToExisting() {
+    if (!dept) return;
+    if (extraYears.length === 0) { actions.toast('Pick at least one year.', 'critical'); return; }
+    const newSections = buildClassSections(state, dept, extraYears, extraCount);
+    if (newSections.length === 0) { actions.toast('Those classes already exist for ' + dept + '.', 'warn'); return; }
+    actions.persist(actions.logActivity(
+      { ...state, classSections: [...state.classSections, ...newSections] },
+      'Classes created for ' + dept + ': ' + newSections.length,
+      { entityType: 'department', entityId: dept },
+    ));
+    actions.toast(newSections.length + ' class(es) created for ' + dept + '.', 'success');
+  }
+
   return (
     <div>
       <div className="mb-5 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -1335,24 +1523,53 @@ function DepartmentsTab({ state, actions, highlightId = null }) {
           <DepartmentCard key={d.id} d={d} state={state} actions={actions} highlightId={highlightId} />
         ))}
       </div>
-      <Card className="max-w-md p-4">
-        <p className="ts-display mb-3 text-sm font-semibold" style={{ color: T.ink }}>Add department</p>
-        <div className="flex gap-2">
-          <Input placeholder="Code, e.g. CIVIL" value={form.id} onChange={(e) => setForm({ ...form, id: e.target.value.toUpperCase() })} className="w-32" />
-          <Input placeholder="Department name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
-          <PrimaryButton
-            icon={Plus}
-            onClick={() => {
-              if (!form.id || !form.name) { actions.toast('Fill in both fields.', 'critical'); return; }
-              actions.addRecord('departments', form, 'Department added: ' + form.name);
-              setForm({ id: '', name: '' });
-              actions.toast('Department added.');
-            }}
-          >
-            Add
-          </PrimaryButton>
-        </div>
-      </Card>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <Card className="p-4">
+          <p className="ts-display mb-3 text-sm font-semibold" style={{ color: T.ink }}>Add department</p>
+          <div className="flex gap-2">
+            <Input placeholder="Code, e.g. CIVIL" value={form.id} onChange={(e) => setForm({ ...form, id: e.target.value.toUpperCase() })} className="w-32" />
+            <Input placeholder="Department name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+          </div>
+
+          <label className="mt-3 flex cursor-pointer items-center gap-2 text-sm" style={{ color: T.ink }}>
+            <input type="checkbox" checked={divide} onChange={(e) => setDivide(e.target.checked)} />
+            Divide into classes (year-wise sections A, B, C{'\u2026'})
+          </label>
+
+          {divide && (
+            <div className="mt-3 rounded-lg border p-3" style={{ borderColor: T.border, background: T.bg }}>
+              <ClassSectionPicker years={years} onYears={setYears} count={count} onCount={setCount} />
+              <div className="mt-3">
+                <ClassPreview deptId={form.id.trim().toUpperCase() || 'DEPT'} years={years} count={count} existing={0} />
+              </div>
+            </div>
+          )}
+
+          <div className="mt-3">
+            <PrimaryButton icon={Plus} onClick={addDepartment}>{divide ? 'Add department & create classes' : 'Add'}</PrimaryButton>
+          </div>
+        </Card>
+
+        <Card className="p-4">
+          <p className="ts-display mb-1 text-sm font-semibold" style={{ color: T.ink }}>Add classes to an existing department</p>
+          <p className="mb-3 text-xs" style={{ color: T.muted }}>For example create section B or C later. Classes that already exist are never duplicated.</p>
+          <Field label="Department">
+            <Select value={dept} onChange={(e) => setExtraDept(e.target.value)}>
+              {state.departments.map((d) => <option key={d.id} value={d.id}>{d.id}</option>)}
+            </Select>
+          </Field>
+          <div className="mt-3 rounded-lg border p-3" style={{ borderColor: T.border, background: T.bg }}>
+            <ClassSectionPicker years={extraYears} onYears={setExtraYears} count={extraCount} onCount={setExtraCount} />
+            <div className="mt-3">
+              <ClassPreview deptId={dept} years={extraYears} count={extraCount} existing={alreadyExisting(dept, extraYears, extraCount)} />
+            </div>
+          </div>
+          <div className="mt-3">
+            <PrimaryButton icon={Plus} onClick={addClassesToExisting} disabled={!dept}>Create classes</PrimaryButton>
+          </div>
+        </Card>
+      </div>
     </div>
   );
 }
@@ -1444,7 +1661,7 @@ function FacultyTab({ state, actions, onAdd }) {
                           const nextSubjects = state.subjects.some((s) => (s.facultyIds || []).includes(f.id))
                             ? state.subjects.map((s) => ((s.facultyIds || []).includes(f.id) ? { ...s, facultyIds: s.facultyIds.filter((id) => id !== f.id) } : s))
                             : state.subjects;
-                          actions.persist(actions.logActivity({ ...state, faculty: state.faculty.filter((x) => x.id !== f.id), subjects: nextSubjects }, 'Faculty removed: ' + f.name));
+                          actions.persist(actions.logActivity({ ...state, faculty: state.faculty.filter((x) => x.id !== f.id), subjects: nextSubjects, classAssignments: (state.classAssignments || []).filter((a) => a.facultyId !== f.id) }, 'Faculty removed: ' + f.name));
                           actions.toast('Faculty removed.');
                         }}
                         className="rounded-md p-1.5 hover:bg-gray-100"
@@ -1486,13 +1703,21 @@ function SubjectRow({ s, state, actions, highlightId, onEdit }) {
         </button>
         <button
           onClick={() => {
+            // Faculty deletion was already blocked while they had timetable slots; subjects were
+            // not - deleting one left blank "ghost" periods in every class that used it (subject
+            // + faculty vanish, the cell stays occupied). Same guard here.
+            const usedSlots = state.timetableEntries.filter((e) => e.subjectId === s.id).length;
+            if (usedSlots > 0) {
+              actions.toast('Can\u2019t delete ' + s.name + ' \u2014 it is still used in ' + usedSlots + ' timetable period(s). Clear those in Create Timetable first.', 'critical');
+              return;
+            }
             // Same dangling-reference cleanup as the faculty-delete side: strip this
             // subject's id out of every faculty.subjectIds so nobody's "Subjects handled"
             // list keeps pointing at a subject that no longer exists.
             const nextFaculty = state.faculty.some((f) => (f.subjectIds || []).includes(s.id))
               ? state.faculty.map((f) => ((f.subjectIds || []).includes(s.id) ? { ...f, subjectIds: f.subjectIds.filter((id) => id !== s.id) } : f))
               : state.faculty;
-            actions.persist(actions.logActivity({ ...state, subjects: state.subjects.filter((x) => x.id !== s.id), faculty: nextFaculty }, 'Subject removed: ' + s.name));
+            actions.persist(actions.logActivity({ ...state, subjects: state.subjects.filter((x) => x.id !== s.id), faculty: nextFaculty, classAssignments: (state.classAssignments || []).filter((a) => a.subjectId !== s.id) }, 'Subject removed: ' + s.name));
             actions.toast('Subject removed.');
           }}
           className="rounded-md p-1.5 hover:bg-gray-100"
@@ -1810,6 +2035,11 @@ function nextFacultyId(state, deptId) {
 
 function AddFacultyModal({ state, actions, onClose, editing = null }) {
   const [showAllSubjects, setShowAllSubjects] = useState(false);
+  // "CSE-III-A takes Data Structures with this teacher, CSE-III-B does not" - kept as
+  // section|subject keys, saved into state.classAssignments on submit.
+  const [classPicks, setClassPicks] = useState(() => new Set(
+    (state.classAssignments || []).filter((a) => editing && a.facultyId === editing.id).map((a) => a.classSectionId + '|' + a.subjectId),
+  ));
   const [form, setForm] = useState(() => editing ? { ...editing } : {
     id: nextFacultyId(state, state.departments[0]?.id || 'GEN'),
     name: '', departmentId: state.departments[0]?.id || '', designation: 'Assistant Professor',
@@ -1849,7 +2079,19 @@ function AddFacultyModal({ state, actions, onClose, editing = null }) {
       : [...state.faculty, form];
     const activityText = editing ? 'Faculty updated: ' + form.name : 'New faculty added: ' + form.name;
 
-    actions.persist(actions.logActivity({ ...state, faculty: nextFaculty, subjects: nextSubjects }, activityText));
+    // Class allocations: drop this teacher's old picks, (re)write the chosen ones. A
+    // section+subject has exactly one teacher, so picking it here replaces whoever had it.
+    const oldAssignments = state.classAssignments || [];
+    const chosen = new Set([...classPicks].filter((k) => nextSubjectIds.includes(k.split('|')[1])));
+    const kept = oldAssignments.filter((a) => !chosen.has(a.classSectionId + '|' + a.subjectId) && a.facultyId !== facultyId);
+    const written = [...chosen].map((k) => {
+      const [classSectionId, subjectId] = k.split('|');
+      const existing = oldAssignments.find((a) => a.classSectionId === classSectionId && a.subjectId === subjectId);
+      return { id: existing?.id || 'CA-' + classSectionId + '-' + subjectId, classSectionId, subjectId, facultyId, weeklyHours: existing?.weeklyHours ?? null };
+    });
+    const nextAssignments = [...kept, ...written];
+
+    actions.persist(actions.logActivity({ ...state, faculty: nextFaculty, subjects: nextSubjects, classAssignments: nextAssignments }, activityText));
     actions.toast(editing ? 'Faculty updated.' : 'Faculty added successfully.');
     onClose();
   }
@@ -1902,6 +2144,45 @@ function AddFacultyModal({ state, actions, onClose, editing = null }) {
           </button>
         </div>
       </div>
+
+      {(form.subjectIds || []).length > 0 && state.classSections.length > 0 && (
+        <div className="mt-3">
+          <span className="mb-1 block text-xs font-semibold" style={{ color: T.muted }}>Which classes take this teacher? (per subject)</span>
+          <div className="space-y-2">
+            {(form.subjectIds || []).map((sid) => {
+              const s = state.subjects.find((x) => x.id === sid);
+              if (!s) return null;
+              const sections = state.classSections.filter((c) => (s.departmentIds || []).includes(c.departmentId) && (!s.year || c.year === s.year));
+              if (!sections.length) return null;
+              const me = editing ? editing.id : form.id;
+              return (
+                <div key={sid} className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-xs font-medium" style={{ color: T.ink }}>{s.name}:</span>
+                  {sections.map((c) => {
+                    const key = c.id + '|' + sid;
+                    const on = classPicks.has(key);
+                    const other = (state.classAssignments || []).find((a) => a.classSectionId === c.id && a.subjectId === sid && a.facultyId && a.facultyId !== me);
+                    const otherName = other ? state.faculty.find((f) => f.id === other.facultyId)?.name : '';
+                    return (
+                      <button
+                        key={key}
+                        type="button"
+                        title={other && !on ? 'Currently taught by ' + otherName + ' \u2014 selecting replaces them' : ''}
+                        onClick={() => setClassPicks((prev) => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; })}
+                        className="rounded-full border px-2.5 py-0.5 text-xs font-medium"
+                        style={{ borderColor: on ? T.primary : T.border, background: on ? T.primaryTint : 'transparent', color: on ? T.primary : T.ink }}
+                      >
+                        {c.departmentId} {c.year}-{c.section}{other && !on ? ' (' + otherName + ')' : ''}
+                      </button>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </div>
+          <p className="mt-1 text-xs" style={{ color: T.muted }}>Leave a class unselected to keep the old rule: any eligible teacher of the subject may be used.</p>
+        </div>
+      )}
 
       <div className="mt-3">
         <span className="mb-1 block text-xs font-semibold" style={{ color: T.muted }}>Availability</span>
@@ -2083,6 +2364,10 @@ function CreateTimetable({ state, actions, conflicts }) {
   const [confirmed, setConfirmed] = useState(false);
   const [cell, setCell] = useState(null);
   const [aiBusy, setAiBusy] = useState(false);
+  const [changeText, setChangeText] = useState('');
+  const [changeBusy, setChangeBusy] = useState(false);
+  const [changeLog, setChangeLog] = useState([]);
+  const [undoSnap, setUndoSnap] = useState(null);
   // The AI call can take many seconds. `state`/`actions` captured when the button was
   // clicked are stale by the time it returns, so writing them back could silently drop
   // edits made meanwhile. Refs always point at the latest render.
@@ -2104,8 +2389,11 @@ function CreateTimetable({ state, actions, conflicts }) {
     setConfirmed(true);
   }
 
-  // Only this class's own YEAR's subjects (was: every subject of the department, all 4 years).
-  const deptSubjects = subjectsForClassSection(state, { departmentId, year });
+  // The class's PLAN: its saved allocations (subject + staff + hours for THIS section) when it
+  // has any, otherwise the department's subjects of this year. Each item is flattened into the
+  // subject shape the drawer / AI code already understands, with the section's own staff + hours.
+  const planCs = classSection || { id: '__none__', departmentId, year };
+  const deptSubjects = planForClassSection(state, planCs).map((i) => ({ ...i.subject, facultyIds: i.facultyIds, weeklyHours: i.weeklyHours }));
   const entriesForClass = classSection ? state.timetableEntries.filter((e) => e.classSectionId === classSection.id) : [];
   const periodSlots = state.periods.filter((p) => p.type === 'period');
 
@@ -2138,18 +2426,83 @@ function CreateTimetable({ state, actions, conflicts }) {
     const targets = scope === 'department'
       ? state.classSections.filter((c) => c.departmentId === departmentId)
       : [classSection];
-    const { entries, unplaced, stats } = generateForClasses({ state, classSections: targets });
-    if (entries.length > 0) {
+    const { entries, unplaced, stats, removeEntryIds } = generateForClasses({ state, classSections: targets });
+    const dropIds = new Set(removeEntryIds);
+    const cleaned = dropIds.size ? 'Removed ' + dropIds.size + ' broken period(s). ' : '';
+    if (entries.length > 0 || dropIds.size > 0) {
       const label = scope === 'department' ? departmentId + ' (' + targets.length + ' classes)' : departmentId + ' ' + year + section;
       actions.persist(actions.logActivity(
-        { ...state, timetableEntries: [...state.timetableEntries, ...entries] },
+        { ...state, timetableEntries: [...state.timetableEntries.filter((e) => !dropIds.has(e.id)), ...entries] },
         'Auto-generated ' + entries.length + ' period(s) for ' + label,
         { entityType: 'timetable', entityId: departmentId },
       ));
     }
-    if (stats.requiredHours === 0) { actions.toast('Nothing to fill \u2014 every subject already has its weekly hours.', 'success'); return; }
-    if (unplaced.length === 0) { actions.toast('Filled ' + entries.length + ' period(s) in ' + stats.ms + ' ms. No conflicts.', 'success'); return; }
-    actions.toast('Placed ' + entries.length + ' of ' + stats.requiredHours + ' period(s). Not placed \u2014 ' + summarizeUnplaced(unplaced), entries.length > 0 ? 'warn' : 'critical');
+    if (stats.requiredHours === 0) { actions.toast(cleaned + 'Nothing to fill \u2014 every subject already has its weekly hours.', 'success'); return; }
+    if (unplaced.length === 0) { actions.toast(cleaned + 'Filled ' + entries.length + ' period(s) in ' + stats.ms + ' ms. No conflicts.', 'success'); return; }
+    actions.toast(cleaned + 'Placed ' + entries.length + ' of ' + stats.requiredHours + ' period(s). Not placed \u2014 ' + summarizeUnplaced(unplaced), entries.length > 0 ? 'warn' : 'critical');
+  }
+
+  // ---- Comment box: one small AI call turns a sentence into operations; everything after
+  // that (legality checks, swaps, refilling) is local code, so the AI can't break the rules.
+  async function applyChangeRequest() {
+    if (!classSection || !changeText.trim() || changeBusy) return;
+    setChangeBusy(true);
+    setChangeLog([]);
+    try {
+      const cs = classSection;
+      const { ops, note } = await parseChangeRequest({ state: stateRef.current, classSection: cs, text: changeText.trim() });
+      if (!ops.length) {
+        setChangeLog([{ ok: false, text: note || 'I could not turn that into a timetable change. Name the subject and the day / period, e.g. "move Data Structures from Day 1 to Wednesday".' }]);
+        return;
+      }
+      const live = stateRef.current;
+      const res = applyChangeOps({ state: live, classSection: cs, ops });
+      let entries = res.entries;
+      const log = [...res.log];
+      if (res.needsRefill) {
+        const gen = generateForClasses({ state: { ...live, timetableEntries: entries }, classSections: [cs], options: { forbid: res.forbid } });
+        entries = [...entries, ...gen.entries];
+        if (gen.entries.length) log.push({ ok: true, text: 'Re-filled ' + gen.entries.length + ' freed period(s) with subjects that still needed hours.' });
+      }
+      if (res.changes > 0) {
+        setUndoSnap(live.timetableEntries.filter((e) => e.classSectionId === cs.id));
+        actionsRef.current.persist(actionsRef.current.logActivity(
+          { ...live, timetableEntries: entries },
+          'Timetable changed by request: ' + departmentId + ' ' + year + section,
+          { entityType: 'timetable', entityId: departmentId },
+        ));
+        setChangeText('');
+      }
+      setChangeLog(log);
+    } catch (err) {
+      setChangeLog([{ ok: false, text: err?.message || 'Something went wrong.' }]);
+    } finally {
+      setChangeBusy(false);
+    }
+  }
+
+  function undoChange() {
+    if (!undoSnap || !classSection) return;
+    const live = stateRef.current;
+    actionsRef.current.persist(actionsRef.current.logActivity(
+      { ...live, timetableEntries: [...live.timetableEntries.filter((e) => e.classSectionId !== classSection.id), ...undoSnap] },
+      'Change undone: ' + departmentId + ' ' + year + section,
+      { entityType: 'timetable', entityId: departmentId },
+    ));
+    setUndoSnap(null);
+    setChangeLog([{ ok: true, text: 'Last change undone.' }]);
+  }
+
+  function removeBroken() {
+    if (!classSection) return;
+    const bad = new Set(findOrphanEntries(state, [classSection.id]).map((e) => e.id));
+    if (!bad.size) return;
+    actions.persist(actions.logActivity(
+      { ...state, timetableEntries: state.timetableEntries.filter((e) => !bad.has(e.id)) },
+      'Removed ' + bad.size + ' broken period(s): ' + departmentId + ' ' + year + section,
+      { entityType: 'timetable', entityId: departmentId },
+    ));
+    actions.toast('Removed ' + bad.size + ' broken period(s). Auto-fill can now use those cells.', 'success');
   }
 
   function clearClass() {
@@ -2163,7 +2516,9 @@ function CreateTimetable({ state, actions, conflicts }) {
     actions.toast('Class timetable cleared.');
   }
 
-  const coverage = classSection ? coverageForClass(state, classSection, deptSubjects) : [];
+  const coverage = classSection ? coverageForClass(state, classSection) : [];
+  const plannedHours = coverage.filter((c) => !c.stray && !c.broken).reduce((s, c) => s + c.required, 0);
+  const gridCells = state.dayOrders.length * periodSlots.length;
 
   async function generateWithAI() {
     if (!classSection || aiBusy) return;
@@ -2252,7 +2607,7 @@ function CreateTimetable({ state, actions, conflicts }) {
           </Field>
           <Field label="Section">
             <Select value={section} onChange={(e) => { setSection(e.target.value); setConfirmed(false); }}>
-              {['A', 'B', 'C'].map((s) => <option key={s} value={s}>{s}</option>)}
+              {[...new Set([...SECTION_LETTERS.slice(0, 3), ...state.classSections.filter((c) => c.departmentId === departmentId).map((c) => c.section)])].sort().map((s) => <option key={s} value={s}>{s}</option>)}
             </Select>
           </Field>
           <Field label="Lecture hall">
@@ -2269,6 +2624,38 @@ function CreateTimetable({ state, actions, conflicts }) {
 
       {confirmed && classSection && (
         <>
+          <ClassAllocationPanel key={classSection.id} state={state} actions={actions} classSection={classSection} />
+
+          <Card className="mb-5 p-4">
+            <p className="ts-display mb-1 text-sm font-semibold" style={{ color: T.ink }}>Change this timetable by comment</p>
+            <p className="mb-2 text-xs" style={{ color: T.muted }}>Describe the change in your own words (English / Tamil / Tanglish). The AI only understands the sentence; moving, swapping and every clash check is done by the app.</p>
+            <div className="flex flex-wrap items-start gap-2">
+              <textarea
+                value={changeText}
+                onChange={(e) => setChangeText(e.target.value)}
+                rows={2}
+                disabled={!isGrokConfigured() || changeBusy}
+                placeholder={'e.g. Day 1 la Data Structures venaam, vera subject podu, DS ah Wednesday ku maathu'}
+                className="min-w-[260px] flex-1 rounded-lg border px-3 py-2 text-sm"
+                style={{ borderColor: T.border, color: T.ink }}
+              />
+              <div className="flex flex-col gap-2">
+                <PrimaryButton icon={Sparkles} onClick={applyChangeRequest} disabled={!isGrokConfigured() || changeBusy || !changeText.trim()}>
+                  {changeBusy ? 'Working\u2026' : 'Apply change'}
+                </PrimaryButton>
+                {undoSnap && <GhostButton onClick={undoChange} disabled={changeBusy}>Undo last change</GhostButton>}
+              </div>
+            </div>
+            {!isGrokConfigured() && <p className="mt-2 text-xs" style={{ color: T.warn }}>Add VITE_GROK_API_KEY to .env.local to enable the comment box (Auto-fill works without it).</p>}
+            {changeLog.length > 0 && (
+              <ul className="mt-3 space-y-1">
+                {changeLog.map((l, i) => (
+                  <li key={i} className="text-xs" style={{ color: l.ok ? T.success : T.critical }}>{l.ok ? '\u2713 ' : '\u2717 '}{l.text}</li>
+                ))}
+              </ul>
+            )}
+          </Card>
+
           <Card className="overflow-x-auto p-4">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
               <p className="ts-display text-sm font-semibold" style={{ color: T.ink }}>{departmentId} {'\u2013'} {year} {section} timetable grid</p>
@@ -2354,13 +2741,25 @@ function CreateTimetable({ state, actions, conflicts }) {
               </tbody>
             </table>
             {coverage.length > 0 && (
-              <div className="mt-3 flex flex-wrap gap-1.5">
-                {coverage.map((c) => (
-                  <span key={c.subjectId} className="rounded-full border px-2.5 py-0.5 text-xs" style={{ borderColor: c.scheduled === c.required ? T.success : c.scheduled > c.required ? T.critical : T.warn, color: c.scheduled === c.required ? T.success : c.scheduled > c.required ? T.critical : T.warn }}>
-                    {c.name} {c.scheduled}/{c.required}
-                  </span>
-                ))}
-              </div>
+              <>
+                <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                  {coverage.map((c) => {
+                    const bad = c.stray || c.broken || c.scheduled > c.required;
+                    const color = bad ? T.critical : c.scheduled === c.required ? T.success : T.warn;
+                    return (
+                      <span key={c.subjectId} className="rounded-full border px-2.5 py-0.5 text-xs" style={{ borderColor: color, color }}>
+                        {c.broken ? c.name + ' \u00d7' + c.scheduled : c.stray ? c.name + ' \u00d7' + c.scheduled + ' (not in this class\u2019s plan)' : c.name + ' ' + c.scheduled + '/' + c.required}
+                      </span>
+                    );
+                  })}
+                  {coverage.some((c) => c.broken) && <GhostButton tone="critical" onClick={removeBroken}>Remove broken entries</GhostButton>}
+                </div>
+                {plannedHours >= gridCells && (
+                  <p className="mt-2 text-xs" style={{ color: T.warn }}>
+                    {plannedHours} planned period(s) for {gridCells} grid cells: there is no free period left, so any single clash leaves a subject unplaced. Check the weekly hours in Class allocation.
+                  </p>
+                )}
+              </>
             )}
           </Card>
 
@@ -2381,6 +2780,149 @@ function CreateTimetable({ state, actions, conflicts }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Class allocation: for ONE class section, which subjects it studies, who teaches
+// each, and how many periods a week. This is what lets CSE-A and CSE-B have
+// different staff for the same subject, a common subject have a different teacher
+// in every department, and one teacher be tied to specific classes.
+// ---------------------------------------------------------------------------
+function ClassAllocationPanel({ state, actions, classSection: cs }) {
+  const saved = (state.classAssignments || []).filter((a) => a.classSectionId === cs.id);
+  const [open, setOpen] = useState(saved.length === 0);
+  const [showOtherYears, setShowOtherYears] = useState(false);
+  const [copyFrom, setCopyFrom] = useState('');
+  const [rows, setRows] = useState({});
+
+  function initialRows() {
+    const out = {};
+    if (saved.length) {
+      saved.forEach((a) => {
+        const s = state.subjects.find((x) => x.id === a.subjectId);
+        out[a.subjectId] = { enabled: true, facultyId: a.facultyId || '', weeklyHours: String(a.weeklyHours ?? s?.weeklyHours ?? '') };
+      });
+    } else {
+      // no allocation yet: pre-fill from the subject master so it is only a review + Save
+      state.subjects
+        .filter((s) => (s.departmentIds || []).includes(cs.departmentId) && (!s.year || s.year === cs.year))
+        .forEach((s) => { out[s.id] = { enabled: true, facultyId: (s.facultyIds || []).length === 1 ? s.facultyIds[0] : '', weeklyHours: String(s.weeklyHours || '') }; });
+    }
+    return out;
+  }
+  useEffect(() => { setRows(initialRows()); }, [cs.id, saved.length]);
+
+  const candidates = state.subjects
+    .filter((s) => (s.departmentIds || []).includes(cs.departmentId) || rows[s.id])
+    .filter((s) => showOtherYears || !s.year || s.year === cs.year || rows[s.id]?.enabled)
+    .sort((a, b) => Number(b.year === cs.year) - Number(a.year === cs.year) || a.name.localeCompare(b.name));
+
+  const setRow = (id, patch) => setRows((r) => ({ ...r, [id]: { enabled: false, facultyId: '', weeklyHours: '', ...(r[id] || {}), ...patch } }));
+  const enabledIds = Object.keys(rows).filter((id) => rows[id]?.enabled);
+  const totalHours = enabledIds.reduce((sum, id) => sum + (Number(rows[id].weeklyHours) || 0), 0);
+  const cells = state.dayOrders.length * state.periods.filter((p) => p.type === 'period').length;
+  const otherSections = state.classSections.filter((c) => c.id !== cs.id && (state.classAssignments || []).some((a) => a.classSectionId === c.id));
+
+  function copy() {
+    const from = (state.classAssignments || []).filter((a) => a.classSectionId === copyFrom);
+    if (!from.length) return;
+    const next = {};
+    from.forEach((a) => {
+      const s = state.subjects.find((x) => x.id === a.subjectId);
+      next[a.subjectId] = { enabled: true, facultyId: a.facultyId || '', weeklyHours: String(a.weeklyHours ?? s?.weeklyHours ?? '') };
+    });
+    setRows(next);
+    actions.toast('Copied. Change the staff that differ for this section, then Save.', 'success');
+  }
+
+  function save() {
+    const next = enabledIds.map((subjectId) => ({
+      id: 'CA-' + cs.id + '-' + subjectId,
+      classSectionId: cs.id,
+      subjectId,
+      facultyId: rows[subjectId].facultyId || null,
+      weeklyHours: Number(rows[subjectId].weeklyHours) || null,
+    }));
+    const others = (state.classAssignments || []).filter((a) => a.classSectionId !== cs.id);
+    actions.persist(actions.logActivity(
+      { ...state, classAssignments: [...others, ...next] },
+      'Class allocation saved: ' + cs.departmentId + ' ' + cs.year + cs.section + ' (' + next.length + ' subject(s))',
+      { entityType: 'timetable', entityId: cs.departmentId },
+    ));
+    actions.toast('Class allocation saved. Auto-fill will now use exactly this staff.', 'success');
+  }
+
+  return (
+    <Card className="mb-5 p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <p className="ts-display text-sm font-semibold" style={{ color: T.ink }}>Class allocation {'\u2014'} who teaches what in {cs.departmentId} {cs.year}-{cs.section}</p>
+          <p className="text-xs" style={{ color: T.muted }}>
+            {saved.length ? saved.length + ' subject(s) allocated to this section.' : 'Not saved yet \u2014 auto-fill uses any eligible teacher until you save this.'}
+          </p>
+        </div>
+        <GhostButton onClick={() => setOpen((v) => !v)}>{open ? 'Hide' : 'Edit allocation'}</GhostButton>
+      </div>
+
+      {open && (
+        <div className="mt-3">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            {otherSections.length > 0 && (
+              <>
+                <Select value={copyFrom} onChange={(e) => setCopyFrom(e.target.value)}>
+                  <option value="">Copy from another section{'\u2026'}</option>
+                  {otherSections.map((c) => <option key={c.id} value={c.id}>{c.departmentId} {c.year}-{c.section}</option>)}
+                </Select>
+                <GhostButton onClick={copy} disabled={!copyFrom}>Copy</GhostButton>
+              </>
+            )}
+            <label className="flex items-center gap-1.5 text-xs" style={{ color: T.muted }}>
+              <input type="checkbox" checked={showOtherYears} onChange={(e) => setShowOtherYears(e.target.checked)} /> show other years' subjects
+            </label>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-xs" style={{ color: T.muted }}>
+                  <th className="px-2 py-1">Taught</th><th className="px-2 py-1">Subject</th><th className="px-2 py-1">Teacher for this section</th><th className="px-2 py-1">Periods / week</th>
+                </tr>
+              </thead>
+              <tbody>
+                {candidates.map((s) => {
+                  const r = rows[s.id] || { enabled: false, facultyId: '', weeklyHours: String(s.weeklyHours || '') };
+                  const eligible = state.faculty.filter((f) => (s.facultyIds || []).includes(f.id));
+                  const others = state.faculty.filter((f) => !(s.facultyIds || []).includes(f.id));
+                  return (
+                    <tr key={s.id} className="border-t" style={{ borderColor: T.border, opacity: r.enabled ? 1 : 0.55 }}>
+                      <td className="px-2 py-1.5"><input type="checkbox" checked={!!r.enabled} onChange={(e) => setRow(s.id, { enabled: e.target.checked, weeklyHours: r.weeklyHours || String(s.weeklyHours || '') })} /></td>
+                      <td className="px-2 py-1.5" style={{ color: T.ink }}>{s.name} <span className="text-xs" style={{ color: T.muted }}>{s.year} {'\u00b7'} {s.type}{(s.departmentIds || []).length > 1 ? ' \u00b7 common' : ''}</span></td>
+                      <td className="px-2 py-1.5">
+                        <Select value={r.facultyId} onChange={(e) => setRow(s.id, { facultyId: e.target.value, enabled: true })}>
+                          <option value="">Any eligible teacher (auto)</option>
+                          {eligible.length > 0 && <optgroup label="Eligible for this subject">{eligible.map((f) => <option key={f.id} value={f.id}>{f.name} {'\u00b7'} {f.departmentId}</option>)}</optgroup>}
+                          <optgroup label="Other staff (any department)">{others.map((f) => <option key={f.id} value={f.id}>{f.name} {'\u00b7'} {f.departmentId}</option>)}</optgroup>
+                        </Select>
+                      </td>
+                      <td className="px-2 py-1.5"><Input type="number" min="0" max="12" value={r.weeklyHours} onChange={(e) => setRow(s.id, { weeklyHours: e.target.value })} style={{ width: 80 }} /></td>
+                    </tr>
+                  );
+                })}
+                {candidates.length === 0 && <tr><td colSpan={4} className="px-2 py-3 text-xs" style={{ color: T.muted }}>No subjects for this department yet. Add them in Master Data first.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            <PrimaryButton onClick={save}>Save allocation</PrimaryButton>
+            <span className="text-xs" style={{ color: totalHours > cells ? T.critical : totalHours === cells ? T.warn : T.muted }}>
+              {totalHours} of {cells} periods planned{totalHours > cells ? ' \u2014 more than the grid can hold' : totalHours === cells ? ' \u2014 no free period left' : ''}
+            </span>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
 function AssignmentDrawer({ state, actions, cell, classSection, deptSubjects, departmentId, onClose }) {
   const [subjectId, setSubjectId] = useState(cell.entry?.subjectId || '');
   const [facultyId, setFacultyId] = useState(cell.entry?.facultyId || '');
@@ -2389,10 +2931,13 @@ function AssignmentDrawer({ state, actions, cell, classSection, deptSubjects, de
   const [pendingConflict, setPendingConflict] = useState(null);
 
   const subject = state.subjects.find((s) => s.id === subjectId);
-  const eligibleFaculty = subject ? state.faculty.filter((f) => subject.facultyIds.includes(f.id)) : [];
+  // deptSubjects carries the CLASS's own staff (allocation) when one exists.
+  const planned = deptSubjects.find((s) => s.id === subjectId);
+  const allowedFacultyIds = planned ? planned.facultyIds : (subject?.facultyIds || []);
+  const eligibleFaculty = subject ? state.faculty.filter((f) => allowedFacultyIds.includes(f.id)) : [];
 
   useEffect(() => {
-    if (subject && subject.facultyIds.length === 1) setFacultyId(subject.facultyIds[0]);
+    if (subject && allowedFacultyIds.length === 1) setFacultyId(allowedFacultyIds[0]);
   }, [subjectId]);
 
   function buildEntry() {

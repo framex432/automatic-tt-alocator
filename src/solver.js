@@ -44,6 +44,48 @@ export function subjectsForClassSection(state, cs) {
   );
 }
 
+// What a class section actually studies + WHO teaches it, per section.
+//  * If the section has class allocations (state.classAssignments: "CSE-III-A ->
+//    Data Structures -> Mrs. X, 5h") those are the source of truth. This is how
+//    section A and section B can have different staff for the same subject, and
+//    how a common subject can have a different teacher in every department.
+//  * Otherwise fall back to the old behaviour: department + year subjects, any
+//    eligible faculty (subject.facultyIds).
+export function planForClassSection(state, cs) {
+  const subjectsById = new Map(state.subjects.map((s) => [s.id, s]));
+  const rows = (state.classAssignments || []).filter((a) => a.classSectionId === cs.id);
+  if (rows.length) {
+    return rows
+      .map((a) => {
+        const subject = subjectsById.get(a.subjectId);
+        if (!subject) return null;
+        return {
+          subject,
+          facultyIds: a.facultyId ? [a.facultyId] : (subject.facultyIds || []),
+          weeklyHours: Number(a.weeklyHours) || Number(subject.weeklyHours) || 0,
+          fixed: !!a.facultyId,
+          assignmentId: a.id,
+        };
+      })
+      .filter(Boolean);
+  }
+  return subjectsForClassSection(state, cs).map((subject) => ({
+    subject, facultyIds: subject.facultyIds || [], weeklyHours: Number(subject.weeklyHours) || 0, fixed: false,
+  }));
+}
+
+// Entries whose subject or faculty no longer exists (subject deleted / re-created,
+// faculty removed). They render as blank boxes in the grid, still occupy the cell,
+// and are counted as nothing - so the class looked "full" but was missing periods.
+export function findOrphanEntries(state, classSectionIds = null) {
+  const subjectIds = new Set(state.subjects.map((s) => s.id));
+  const facultyIds = new Set(state.faculty.map((f) => f.id));
+  const only = classSectionIds ? new Set(classSectionIds) : null;
+  return state.timetableEntries.filter(
+    (e) => (!only || only.has(e.classSectionId)) && (!subjectIds.has(e.subjectId) || !facultyIds.has(e.facultyId)),
+  );
+}
+
 // A "combined class": one common (multi-department) subject, taught by the same
 // faculty to two different departments in the same slot. That is ONE lecture, not
 // a double-booking, so conflict checks must not flag it.
@@ -235,8 +277,7 @@ function choosePrimary(ctx, idx, cs, subject, eligible) {
 
 // ---------------------------------------------------------- one class, one go --
 
-function diagnose(ctx, idx, subject) {
-  const eligible = eligibleFacultyOf(ctx, subject);
+function diagnose(ctx, idx, subject, eligible) {
   if (!eligible.length) return 'No faculty assigned to this subject';
   const anyAvail = eligible.filter((f) => ctx.days.some((d) => facultyAvailableOn(f, d)));
   if (!anyAvail.length) return 'Eligible faculty are unavailable on every working day';
@@ -247,23 +288,27 @@ function diagnose(ctx, idx, subject) {
     : 'No free slot left (class grid / faculty clashes)';
 }
 
-function buildTasks(ctx, idx, cs, subjects, rand, jitter) {
+function buildTasks(ctx, idx, cs, plan, rand, jitter) {
   const labTasks = [];
   const theoryOrder = [];
   const unplaced = [];
   const primaries = new Map();
 
-  for (const subject of subjects) {
+  for (const item of plan) {
+    const subject = item.subject;
     const scheduled = idx.clsSubj.get(cs.id + '|' + subject.id) || 0;
-    const remaining = (Number(subject.weeklyHours) || 0) - scheduled;
+    const remaining = item.weeklyHours - scheduled;
     if (remaining <= 0) continue;
-    const eligible = eligibleFacultyOf(ctx, subject);
+    const eligible = item.facultyIds.map((id) => ctx.facultyById.get(id)).filter(Boolean);
     if (!eligible.length) {
-      unplaced.push({ classSectionId: cs.id, subjectId: subject.id, missing: remaining, reason: 'No faculty assigned to this subject' });
+      unplaced.push({
+        classSectionId: cs.id, subjectId: subject.id, missing: remaining,
+        reason: item.fixed ? 'The staff allocated to this class no longer exists' : 'No faculty assigned to this subject',
+      });
       continue;
     }
     primaries.set(subject.id, choosePrimary(ctx, idx, cs, subject, eligible));
-    theoryOrder.push({ subject, remaining, eligible, key: eligible.length * 100 - remaining + (jitter ? rand() * 3 : 0) });
+    theoryOrder.push({ subject, weekly: item.weeklyHours, remaining, eligible, key: eligible.length * 100 - remaining + (jitter ? rand() * 3 : 0) });
   }
 
   theoryOrder.sort((a, b) => a.key - b.key);
@@ -290,17 +335,20 @@ function placeTask(ctx, idx, cs, task, primaryId, opt, rand, jitter) {
   const otherDeptEntries = common
     ? (idx.subjEntries.get(subject.id) || []).filter((e) => e.departmentId !== cs.departmentId)
     : [];
-  const weekly = Number(subject.weeklyHours) || 0;
+  const weekly = task.weekly;
   const have = idx.clsSubj.get(cs.id + '|' + subject.id) || 0;
   if (have + L > weekly) return null;
+  const forbid = opt.forbidSet;
 
   let best = null;
 
   for (const day of ctx.days) {
+    if (forbid && forbid.has(cs.id + '|' + subject.id + '|' + day.id + '|*')) continue;
     if (!lab && (idx.clsSubjDay.get(cs.id + '|' + subject.id + '|' + day.id) || 0) >= opt.maxTheoryPerDay) continue;
     for (let i = 0; i + L <= nPeriods; i++) {
       const cells = ctx.periodSlots.slice(i, i + L);
       if (cells.some((p) => idx.clsCell.has(cs.id + '|' + day.id + '|' + p.id))) continue;
+      if (forbid && cells.some((p) => forbid.has(cs.id + '|' + subject.id + '|' + day.id + '|' + p.id))) continue;
       const cellKeys = cells.map((p) => day.id + '|' + p.id);
 
       for (const f of eligible) {
@@ -357,7 +405,7 @@ function placeTask(ctx, idx, cs, task, primaryId, opt, rand, jitter) {
   return { entries: out, score: best.score };
 }
 
-function runAttempt(ctx, classSections, attempt, opt, subjectsOf) {
+function runAttempt(ctx, classSections, attempt, opt, planOf) {
   const rand = mulberry32(1337 + attempt * 7919);
   const jitter = attempt > 0;
   const idx = newIndex();
@@ -369,21 +417,23 @@ function runAttempt(ctx, classSections, attempt, opt, subjectsOf) {
   let penalty = 0;
 
   for (const cs of order) {
-    const { tasks, unplaced: noFaculty, primaries } = buildTasks(ctx, idx, cs, subjectsOf(cs), rand, jitter);
+    const { tasks, unplaced: noFaculty, primaries } = buildTasks(ctx, idx, cs, planOf(cs), rand, jitter);
     unplaced.push(...noFaculty);
     const missByCls = new Map();
+    const eligibleBy = new Map();
 
     for (const task of tasks) {
       const res = placeTask(ctx, idx, cs, task, primaries.get(task.subject.id), opt, rand, jitter);
       if (!res) {
         missByCls.set(task.subject.id, (missByCls.get(task.subject.id) || 0) + task.L);
+        eligibleBy.set(task.subject.id, task.eligible);
         continue;
       }
       res.entries.forEach((e) => { addEntry(idx, e); placed.push(e); });
       penalty += res.score;
     }
     for (const [subjectId, missing] of missByCls) {
-      unplaced.push({ classSectionId: cs.id, subjectId, missing, reason: diagnose(ctx, idx, ctx.subjectsById.get(subjectId)) });
+      unplaced.push({ classSectionId: cs.id, subjectId, missing, reason: diagnose(ctx, idx, ctx.subjectsById.get(subjectId), eligibleBy.get(subjectId)) });
     }
   }
   const unplacedHours = unplaced.reduce((s, u) => s + u.missing, 0);
@@ -398,23 +448,34 @@ function runAttempt(ctx, classSections, attempt, opt, subjectsOf) {
  *
  * @returns {{ entries, unplaced: {classSectionId, subjectId, missing, reason}[], stats }}
  */
-export function generateForClasses({ state, classSections, options = {} }) {
+export function generateForClasses({ state: rawState, classSections, options = {} }) {
   const opt = { ...DEFAULTS, ...options };
-  const ctx = prepare(state);
-  const subjectsOf = (cs) => subjectsForClassSection(state, cs);
   const t0 = nowMs();
+
+  // Broken entries of the target classes are treated as EMPTY cells and reported
+  // back (removeEntryIds) so the caller deletes them in the same save.
+  const orphans = findOrphanEntries(rawState, classSections.map((c) => c.id));
+  const orphanIds = new Set(orphans.map((e) => e.id));
+  const state = orphanIds.size ? { ...rawState, timetableEntries: rawState.timetableEntries.filter((e) => !orphanIds.has(e.id)) } : rawState;
+
+  if (opt.forbid && opt.forbid.length) {
+    opt.forbidSet = new Set(opt.forbid.map((r) => r.classSectionId + '|' + r.subjectId + '|' + r.dayOrderId + '|' + (r.periodId || '*')));
+  }
+
+  const ctx = prepare(state);
+  const planOf = (cs) => planForClassSection(state, cs);
 
   let required = 0;
   const preScheduled = new Map();
   state.timetableEntries.forEach((e) => preScheduled.set(e.classSectionId + '|' + e.subjectId, (preScheduled.get(e.classSectionId + '|' + e.subjectId) || 0) + 1));
-  classSections.forEach((cs) => subjectsOf(cs).forEach((s) => {
-    required += Math.max(0, (Number(s.weeklyHours) || 0) - (preScheduled.get(cs.id + '|' + s.id) || 0));
+  classSections.forEach((cs) => planOf(cs).forEach((item) => {
+    required += Math.max(0, item.weeklyHours - (preScheduled.get(cs.id + '|' + item.subject.id) || 0));
   }));
 
   let best = null;
   let attempts = 0;
   for (; attempts < opt.maxAttempts; attempts++) {
-    const res = runAttempt(ctx, classSections, attempts, opt, subjectsOf);
+    const res = runAttempt(ctx, classSections, attempts, opt, planOf);
     if (!best || res.unplacedHours < best.unplacedHours || (res.unplacedHours === best.unplacedHours && res.penalty < best.penalty)) best = res;
     if (best.unplacedHours === 0 && attempts + 1 >= opt.minAttemptsWhenPerfect) { attempts++; break; }
     if (nowMs() - t0 > opt.timeBudgetMs) { attempts++; break; }
@@ -422,6 +483,7 @@ export function generateForClasses({ state, classSections, options = {} }) {
 
   return {
     entries: best.entries,
+    removeEntryIds: [...orphanIds],
     unplaced: best.unplaced,
     stats: {
       attempts,
@@ -429,18 +491,33 @@ export function generateForClasses({ state, classSections, options = {} }) {
       requiredHours: required,
       placedHours: best.entries.length,
       unplacedHours: best.unplacedHours,
+      orphansRemoved: orphanIds.size,
     },
   };
 }
 
-// Required vs scheduled periods per subject for one class (drives the small
-// "coverage" strip under the grid, so a half-filled timetable is obvious).
-export function coverageForClass(state, cs, subjects = subjectsForClassSection(state, cs)) {
+// Required vs scheduled periods per subject for one class (drives the "coverage"
+// strip under the grid). Also surfaces STRAY periods (a subject placed in this class
+// that is not part of its plan) and BROKEN periods (subject/faculty deleted), which
+// used to be invisible - the grid looked full while the counts didn't add up.
+export function coverageForClass(state, cs) {
+  const plan = planForClassSection(state, cs);
   const mine = state.timetableEntries.filter((e) => e.classSectionId === cs.id);
-  return subjects.map((s) => ({
-    subjectId: s.id,
-    name: s.name,
-    required: Number(s.weeklyHours) || 0,
-    scheduled: mine.filter((e) => e.subjectId === s.id).length,
+  const subjectsById = new Map(state.subjects.map((s) => [s.id, s]));
+  const rows = plan.map((item) => ({
+    subjectId: item.subject.id,
+    name: item.subject.name,
+    required: item.weeklyHours,
+    scheduled: mine.filter((e) => e.subjectId === item.subject.id).length,
   }));
+  const planned = new Set(plan.map((p) => p.subject.id));
+  const strayCount = new Map();
+  let broken = 0;
+  mine.forEach((e) => {
+    if (!subjectsById.has(e.subjectId)) { broken++; return; }
+    if (!planned.has(e.subjectId)) strayCount.set(e.subjectId, (strayCount.get(e.subjectId) || 0) + 1);
+  });
+  strayCount.forEach((n, id) => rows.push({ subjectId: id, name: subjectsById.get(id).name, required: 0, scheduled: n, stray: true }));
+  if (broken) rows.push({ subjectId: '__broken', name: 'Broken entries (subject deleted)', required: 0, scheduled: broken, broken: true });
+  return rows;
 }

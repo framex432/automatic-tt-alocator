@@ -24,7 +24,7 @@
 // NOTE on security: the key ships in the browser bundle. Fine for an internal
 // staff tool; for anything public move this fetch into a Supabase Edge Function.
 // ---------------------------------------------------------------------------
-import { isCombinedPair } from './solver';
+import { isCombinedPair, planForClassSection } from './solver.js';
 
 const GROK_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROK_MODEL = 'openai/gpt-oss-120b';
@@ -150,6 +150,53 @@ Rules:
   return { system, user };
 }
 
+// One place for the HTTP call + friendly errors, shared by every AI feature.
+async function callChat({ system, user, maxTokens, onRetry }) {
+  const key = apiKey();
+  if (!key) {
+    throw new Error('No Groq API key found. Add VITE_GROK_API_KEY to .env.local (key from console.groq.com/keys) and restart the dev server.');
+  }
+  let response;
+  try {
+    response = await fetchWithRetry(GROK_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
+      body: JSON.stringify({
+        model: GROK_MODEL,
+        temperature: 0.1,
+        max_completion_tokens: maxTokens,
+        reasoning_effort: 'low',
+        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+      }),
+    }, onRetry);
+  } catch (err) {
+    throw new Error('Could not reach the AI service (' + (err?.message || 'network error') + ').');
+  }
+
+  if (!response.ok) {
+    let detail = '';
+    try {
+      const body = await response.json();
+      detail = body?.error?.message || (typeof body?.error === 'string' ? body.error : '') || body?.message || '';
+      if (!detail && body) detail = JSON.stringify(body).slice(0, 300);
+      // eslint-disable-next-line no-console
+      console.error('Groq API error response:', body);
+    } catch { /* not JSON */ }
+    if (response.status === 401 || response.status === 403) {
+      throw new Error('Groq rejected the API key (HTTP ' + response.status + '). Use a key from console.groq.com/keys (not x.ai), no extra spaces/quotes, then restart the dev server.');
+    }
+    if (response.status === 404) throw new Error('Groq model "' + GROK_MODEL + '" not found for this account (HTTP 404). ' + detail);
+    if (response.status === 413) throw new Error('Request too large for the AI service (HTTP 413). Use the local Auto-fill instead.');
+    if (response.status === 429) throw new Error('Groq is still rate-limited after ' + MAX_429_RETRIES + ' retries. Wait a minute and try again.');
+    throw new Error('Groq API error ' + response.status + (detail ? ': ' + detail : ''));
+  }
+
+  const data = await response.json();
+  const text = data?.choices?.[0]?.message?.content;
+  if (!text) throw new Error('The AI returned an empty response (it may have run out of output tokens).');
+  return text;
+}
+
 function extractJsonArray(text) {
   const cleaned = text.trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
   const start = cleaned.indexOf('[');
@@ -181,44 +228,7 @@ export async function generateTimetableWithAI({ state, departmentId, classSectio
   const allOtherEntries = state.timetableEntries.filter((e) => e.classSectionId !== classSection.id);
   const { system, user } = buildPrompt({ state, departmentId, classSection, deptSubjects, periodSlots, existingEntriesForClass, allOtherEntries });
 
-  let response;
-  try {
-    response = await fetchWithRetry(GROK_API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
-      body: JSON.stringify({
-        model: GROK_MODEL,
-        temperature: 0.2,
-        max_completion_tokens: MAX_OUTPUT_TOKENS,
-        reasoning_effort: 'low',
-        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
-      }),
-    }, onRetry);
-  } catch (err) {
-    throw new Error('Could not reach the AI service (' + (err?.message || 'network error') + ').');
-  }
-
-  if (!response.ok) {
-    let detail = '';
-    try {
-      const body = await response.json();
-      detail = body?.error?.message || (typeof body?.error === 'string' ? body.error : '') || body?.message || '';
-      if (!detail && body) detail = JSON.stringify(body).slice(0, 300);
-      // eslint-disable-next-line no-console
-      console.error('Groq API error response:', body);
-    } catch { /* not JSON */ }
-    if (response.status === 401 || response.status === 403) {
-      throw new Error('Groq rejected the API key (HTTP ' + response.status + '). Use a key from console.groq.com/keys (not x.ai), no extra spaces/quotes, then restart the dev server.');
-    }
-    if (response.status === 404) throw new Error('Groq model "' + GROK_MODEL + '" not found for this account (HTTP 404). ' + detail);
-    if (response.status === 413) throw new Error('Request too large for the AI service (HTTP 413). Use the local Auto-fill instead.');
-    if (response.status === 429) throw new Error('Groq is still rate-limited after ' + MAX_429_RETRIES + ' retries. Wait a minute and try again.');
-    throw new Error('Groq API error ' + response.status + (detail ? ': ' + detail : ''));
-  }
-
-  const data = await response.json();
-  const text = data?.choices?.[0]?.message?.content;
-  if (!text) throw new Error('The AI returned an empty response (it may have run out of output tokens).');
+  const text = await callChat({ system, user, maxTokens: MAX_OUTPUT_TOKENS, onRetry });
 
   let raw;
   try { raw = extractJsonArray(text); } catch { throw new Error('Could not parse the AI response as JSON.'); }
@@ -295,4 +305,93 @@ export async function generateTimetableWithAI({ state, departmentId, classSectio
   }
 
   return { entries, skipped };
+}
+
+// ---------------------------------------------------------------------------
+// "Comment box": turn a sentence (English / Tamil / Tanglish) into structured
+// change operations for ONE class. ONE small API call (~600 tokens); executing
+// and validating the operations is done locally by editor.js.
+// ---------------------------------------------------------------------------
+export function buildChangePrompt({ state, classSection, text }) {
+  const periodSlots = state.periods.filter((p) => p.type === 'period');
+  const plan = planForClassSection(state, classSection);
+  const entries = state.timetableEntries.filter((e) => e.classSectionId === classSection.id);
+
+  // short aliases keep the prompt tiny and stop the model inventing long random ids
+  const dayAlias = new Map(state.dayOrders.map((d, i) => [d.id, 'D' + (i + 1)]));
+  const perAlias = new Map(periodSlots.map((p, i) => [p.id, 'P' + (i + 1)]));
+  const subjIds = [...new Set([...plan.map((i) => i.subject.id), ...entries.map((e) => e.subjectId)])].filter((id) => state.subjects.some((s) => s.id === id));
+  const subAlias = new Map(subjIds.map((id, i) => [id, 'S' + (i + 1)]));
+
+  const maps = {
+    day: new Map([...dayAlias].map(([id, a]) => [a, id])),
+    period: new Map([...perAlias].map(([id, a]) => [a, id])),
+    subject: new Map([...subAlias].map(([id, a]) => [a, id])),
+  };
+
+  const system = `You convert a college timetable change request (English, Tamil or Tanglish) into JSON operations for ONE class.
+Reply with ONE JSON object only: {"ops":[...],"note":"<only when something cannot be expressed>"}.
+Use ONLY the ids given (D#=day order, P#=period, S#=subject). Never invent ids.
+Operations:
+{"op":"move","subject":"S1","from":{"day":"D1","period":null},"to":{"day":"D3","period":null},"fillVacated":true}
+   move a period of a subject to another day/period (null period = any). fillVacated=true when the user wants ANOTHER subject to take the vacated slot ("instead", "vera subject potu", "replace").
+{"op":"swap","a":{"subject":"S1","day":"D1","period":"P1"},"b":{"subject":"S2","day":"D3","period":"P2"}}
+{"op":"remove","subject":"S1","day":"D1","period":null,"forbid":true}   forbid=true when the subject must not come back there.
+{"op":"set","subject":"S4","day":"D2","period":"P3"}   put a subject into a specific cell (replaces what is there).
+"Day 1 / first day order" = the day labelled I; a weekday name means the day with that weekday. Several requests in one sentence = several ops, in order.
+If the request is unclear or impossible, return {"ops":[],"note":"<short reason>"}.`;
+
+  const user = JSON.stringify({
+    request: text,
+    days: state.dayOrders.map((d) => ({ id: dayAlias.get(d.id), label: d.label, weekday: d.actualDay })),
+    periods: periodSlots.map((p) => ({ id: perAlias.get(p.id), label: p.label })),
+    subjects: subjIds.map((id) => { const s = state.subjects.find((x) => x.id === id); return { id: subAlias.get(id), name: s.name, code: s.code }; }),
+    grid: entries.map((e) => dayAlias.get(e.dayOrderId) + ':' + perAlias.get(e.periodId) + '=' + (subAlias.get(e.subjectId) || '?')),
+  });
+  return { system, user, maps };
+}
+
+// Map the model's aliases back to real ids and drop anything that does not exist.
+export function normalizeOps(rawOps, maps) {
+  const dropped = [];
+  const D = (a) => (a == null ? undefined : maps.day.get(a));
+  const P = (a) => (a == null ? undefined : maps.period.get(a));
+  const S = (a) => (a == null ? undefined : maps.subject.get(a));
+  const ok = (v, given) => given == null || v !== undefined; // a given alias must resolve
+  const ops = [];
+  for (const o of Array.isArray(rawOps) ? rawOps : []) {
+    if (!o || typeof o !== 'object') continue;
+    if (o.op === 'move') {
+      const subjectId = S(o.subject);
+      if (!subjectId || !ok(D(o.from?.day), o.from?.day) || !ok(P(o.from?.period), o.from?.period) || !D(o.to?.day) || !ok(P(o.to?.period), o.to?.period)) { dropped.push('move'); continue; }
+      ops.push({ op: 'move', subjectId, from: { dayOrderId: D(o.from?.day), periodId: P(o.from?.period) }, to: { dayOrderId: D(o.to.day), periodId: P(o.to?.period) }, fillVacated: !!o.fillVacated });
+    } else if (o.op === 'swap') {
+      const a = { subjectId: S(o.a?.subject), dayOrderId: D(o.a?.day), periodId: P(o.a?.period) };
+      const b = { subjectId: S(o.b?.subject), dayOrderId: D(o.b?.day), periodId: P(o.b?.period) };
+      if (!a.subjectId || !b.subjectId || !ok(a.dayOrderId, o.a?.day) || !ok(b.dayOrderId, o.b?.day) || !ok(a.periodId, o.a?.period) || !ok(b.periodId, o.b?.period)) { dropped.push('swap'); continue; }
+      ops.push({ op: 'swap', a, b });
+    } else if (o.op === 'remove') {
+      const subjectId = S(o.subject);
+      if ((o.subject != null && !subjectId) || !ok(D(o.day), o.day) || !ok(P(o.period), o.period) || (!subjectId && o.day == null && o.period == null)) { dropped.push('remove'); continue; }
+      ops.push({ op: 'remove', subjectId, dayOrderId: D(o.day), periodId: P(o.period), forbid: !!o.forbid });
+    } else if (o.op === 'set') {
+      const subjectId = S(o.subject);
+      if (!subjectId || !D(o.day) || !P(o.period)) { dropped.push('set'); continue; }
+      ops.push({ op: 'set', subjectId, dayOrderId: D(o.day), periodId: P(o.period) });
+    } else dropped.push(String(o.op));
+  }
+  return { ops, dropped };
+}
+
+export async function parseChangeRequest({ state, classSection, text, onRetry }) {
+  const { system, user, maps } = buildChangePrompt({ state, classSection, text });
+  const reply = await callChat({ system, user, maxTokens: 1200, onRetry });
+  const start = reply.indexOf('{');
+  const end = reply.lastIndexOf('}');
+  let parsed;
+  try { parsed = JSON.parse(reply.slice(start, end + 1)); } catch { throw new Error('Could not understand the AI reply. Try rephrasing the change.'); }
+  const { ops, dropped } = normalizeOps(parsed.ops, maps);
+  let note = typeof parsed.note === 'string' ? parsed.note : '';
+  if (dropped.length && !ops.length) note = note || 'The request referred to a day, period or subject that is not in this class.';
+  return { ops, note, dropped };
 }

@@ -16,6 +16,8 @@ const TABLE_BY_KEY = {
   classrooms: 'classrooms',
   labs: 'labs',
   classSections: 'class_sections',
+  // who teaches which subject in which section (see supabase-migration-class-assignments.sql)
+  classAssignments: 'class_assignments',
   timetableEntries: 'timetable_entries',
   activityLog: 'activity_log',
 };
@@ -31,6 +33,7 @@ const FIELD_MAP = {
   classrooms: { departmentId: 'department_id' },
   labs: { departmentId: 'department_id' },
   classSections: { departmentId: 'department_id', roomId: 'room_id' },
+  classAssignments: { classSectionId: 'class_section_id', subjectId: 'subject_id', facultyId: 'faculty_id', weeklyHours: 'weekly_hours' },
   timetableEntries: {
     departmentId: 'department_id', classSectionId: 'class_section_id', dayOrderId: 'day_order_id',
     periodId: 'period_id', subjectId: 'subject_id', facultyId: 'faculty_id', roomId: 'room_id',
@@ -151,6 +154,17 @@ export async function loadState() {
   const firstError = eDept || eDay || ePeriod || eFac || eSub || eRoom || eLab || eCls || eTT || eAct || eJoin || eCollege;
   if (firstError) throw firstError;
 
+  // class_assignments is loaded separately: if the migration hasn't been run yet the
+  // table doesn't exist, and that must not take the whole app down.
+  let classAssignments = [];
+  const { data: caRows, error: eCA } = await fetchAll('class_assignments', ['id']);
+  if (eCA) {
+    // eslint-disable-next-line no-console
+    console.warn('class_assignments not available yet (run supabase-migration-class-assignments.sql):', eCA.message);
+  } else {
+    classAssignments = (caRows || []).map((r) => fromRow('classAssignments', r));
+  }
+
   const facultyIdsBySubject = {};
   const subjectIdsByFaculty = {};
   (subjectFaculty || []).forEach(({ subject_id, faculty_id }) => {
@@ -203,6 +217,7 @@ export async function loadState() {
     classrooms: (classrooms || []).map((r) => fromRow('classrooms', r)),
     labs: (labs || []).map((r) => fromRow('labs', r)),
     classSections: (classSectionsRaw || []).map((r) => fromRow('classSections', r)),
+    classAssignments,
     timetableEntries: (timetableEntriesRaw || []).map((r) => fromRow('timetableEntries', r)),
     activityLog: (activityLogRaw || []).map((r) => ({
       ...fromRow('activityLog', r),
@@ -265,6 +280,28 @@ function planCollection(key, prevList, nextList) {
   return { inserts, updates, deletedIds, prevById };
 }
 
+// Upsert a batch. Moving/swapping timetable periods can transiently violate a UNIQUE
+// constraint such as (class_section_id, day_order_id, period_id): in one statement,
+// "A moves onto B's cell" is checked before "B moves away" (Postgres error 23505).
+// Fall back to delete-then-insert of just those rows, which is always valid, and put
+// the old rows back if that insert fails so nothing is lost.
+async function upsertRows(key, table, rows, plan) {
+  const { error } = await supabase.from(table).upsert(rows, { onConflict: 'id' });
+  if (!error) return;
+  if (error.code !== '23505') throw error;
+  const ids = rows.map((r) => r.id);
+  for (const part of chunk(ids, DELETE_CHUNK)) {
+    const { error: eDel } = await supabase.from(table).delete().in('id', part);
+    if (eDel) throw eDel;
+  }
+  const { error: eIns } = await supabase.from(table).insert(rows);
+  if (eIns) {
+    const previous = ids.map((id) => plan.prevById.get(id)).filter(Boolean).map((r) => toRow(key, r));
+    if (previous.length) await supabase.from(table).insert(previous);
+    throw eIns;
+  }
+}
+
 async function writeCollection(key, plan) {
   const table = TABLE_BY_KEY[key];
   for (const part of chunk(plan.inserts, INSERT_CHUNK)) {
@@ -272,10 +309,7 @@ async function writeCollection(key, plan) {
     if (error) throw error;
   }
   for (const group of groupBySignature(plan.updates.map((r) => toRow(key, r)))) {
-    for (const part of chunk(group, INSERT_CHUNK)) {
-      const { error } = await supabase.from(table).upsert(part, { onConflict: 'id' });
-      if (error) throw error;
-    }
+    for (const part of chunk(group, INSERT_CHUNK)) await upsertRows(key, table, part, plan);
   }
 
   // subjects own the editable end of the faculty<->subject relationship (see
