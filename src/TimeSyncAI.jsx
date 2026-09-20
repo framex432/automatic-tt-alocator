@@ -1293,10 +1293,20 @@ function DepartmentCard({ d, state, actions, highlightId }) {
   const sortedClasses = [...deptClassSections].sort((a, b) =>
     (YEAR_OPTIONS.indexOf(a.year) - YEAR_OPTIONS.indexOf(b.year)) || String(a.section).localeCompare(String(b.section)));
 
+  function fixBatch(c) {
+    const batch = batchForYear(state, c.year);
+    actions.persist(actions.logActivity(
+      { ...state, classSections: state.classSections.map((x) => (x.id === c.id ? { ...x, batch, semester: semesterForYear(c.year) } : x)) },
+      'Batch corrected: ' + classLabel(state, c) + ' -> ' + batch,
+      { entityType: 'department', entityId: d.id },
+    ));
+    actions.toast(classLabel(state, c) + ': batch set to ' + batch + '.', 'success');
+  }
+
   function deleteClass(c) {
     const periods = state.timetableEntries.filter((e) => e.classSectionId === c.id).length;
     const allocated = (state.classAssignments || []).filter((a) => a.classSectionId === c.id).length;
-    const label = d.id + ' ' + c.year + '-' + c.section;
+    const label = classLabel(state, c);
     const extra = [periods > 0 && periods + ' timetable period(s)', allocated > 0 && allocated + ' staff allocation(s)'].filter(Boolean).join(' and ');
     if (!window.confirm('Delete class ' + label + '?' + (extra ? ' Its ' + extra + ' will be deleted too.' : '') + ' This cannot be undone.')) return;
     actions.persist(actions.logActivity(
@@ -1378,12 +1388,18 @@ function DepartmentCard({ d, state, actions, highlightId }) {
                 return (
                   <li key={c.id} className="flex items-center justify-between gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-gray-50">
                     <div>
-                      <span className="font-semibold" style={{ color: T.ink }}>{c.year} year {'\u2013'} Section {c.section}</span>
+                      <span className="font-semibold" style={{ color: T.ink }}>{deptClassSections.filter((x) => x.year === c.year).length > 1 ? c.year + ' year \u2013 Section ' + c.section : c.year + ' year'}</span>
                       <span className="ml-2" style={{ color: T.muted }}>
                         {c.batch ? c.batch + ' \u00b7 ' : ''}{periods} period{periods === 1 ? '' : 's'} scheduled{allocated ? ' \u00b7 ' + allocated + ' subject(s) allocated' : ''}
                       </span>
+                      {c.batch !== batchForYear(state, c.year) && (
+                        <button type="button" onClick={() => fixBatch(c)} className="ml-2 rounded px-1.5 py-0.5 text-[11px] font-semibold" style={{ background: T.warnTint, color: T.warn }}
+                          title={'A ' + c.year + ' year class should have batch ' + batchForYear(state, c.year) + ' (from Academic year in Master Data \u2192 College)'}>
+                          Set batch {batchForYear(state, c.year)}
+                        </button>
+                      )}
                     </div>
-                    <button type="button" onClick={() => deleteClass(c)} className="rounded-md p-1 hover:bg-gray-100" title={'Delete ' + d.id + ' ' + c.year + '-' + c.section}>
+                    <button type="button" onClick={() => deleteClass(c)} className="rounded-md p-1 hover:bg-gray-100" title={'Delete ' + classLabel(state, c)}>
                       <Trash2 size={13} color={T.critical} />
                     </button>
                   </li>
@@ -1400,20 +1416,35 @@ function DepartmentCard({ d, state, actions, highlightId }) {
 const YEAR_OPTIONS = ['I', 'II', 'III', 'IV'];
 const SECTION_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F'];
 
+// Batch (joining year - passing year) follows from the CLASS YEAR and the academic year set in
+// Master Data -> College: I year joined this academic year, II year one year earlier, ...
+// (Create Timetable used to default every class to 2024-2028 and semester 5, whatever the year.)
+function batchForYear(state, year) {
+  const parsed = parseInt(String(state.college?.academicYear || '').slice(0, 4), 10);
+  const start = Number.isFinite(parsed) ? parsed : new Date().getFullYear();
+  const yi = Math.max(0, YEAR_OPTIONS.indexOf(year));
+  return (start - yi) + '\u2013' + (start - yi + 4);
+}
+function semesterForYear(year) { return Math.max(0, YEAR_OPTIONS.indexOf(year)) * 2 + 1; }
+
+// "CSE III-A" only when that year really has more than one class. With a single class the
+// section letter means nothing, so it is "CSE III year".
+function classLabel(state, cs) {
+  if (!cs) return '';
+  const sameYear = state.classSections.filter((c) => c.departmentId === cs.departmentId && c.year === cs.year);
+  return sameYear.length > 1 ? cs.departmentId + ' ' + cs.year + '-' + cs.section : cs.departmentId + ' ' + cs.year + ' year';
+}
+
 // Build the class_sections rows for a department: every chosen year x sections A..N.
 // Rows that already exist (same department + year + section) are skipped, so this is
 // safe to run again later to add "C" to a department that already has A and B.
 function buildClassSections(state, departmentId, years, sectionCount) {
-  const parsed = parseInt(String(state.college?.academicYear || '').slice(0, 4), 10);
-  const start = Number.isFinite(parsed) ? parsed : new Date().getFullYear();
   const out = [];
   YEAR_OPTIONS.filter((y) => years.includes(y)).forEach((year) => {
-    const yi = YEAR_OPTIONS.indexOf(year);
     for (let i = 0; i < sectionCount; i++) {
       const section = SECTION_LETTERS[i];
       if (state.classSections.some((c) => c.departmentId === departmentId && c.year === year && c.section === section)) continue;
-      // I year joined this academic year, II year one year earlier, ...  Semester = odd semester of that year.
-      out.push({ id: uid('CLS'), departmentId, batch: (start - yi) + '\u2013' + (start - yi + 4), year, semester: yi * 2 + 1, section, roomId: null });
+      out.push({ id: uid('CLS'), departmentId, batch: batchForYear(state, year), year, semester: semesterForYear(year), section, roomId: null });
     }
   });
   return out;
@@ -2172,7 +2203,7 @@ function AddFacultyModal({ state, actions, onClose, editing = null }) {
                         className="rounded-full border px-2.5 py-0.5 text-xs font-medium"
                         style={{ borderColor: on ? T.primary : T.border, background: on ? T.primaryTint : 'transparent', color: on ? T.primary : T.ink }}
                       >
-                        {c.departmentId} {c.year}-{c.section}{other && !on ? ' (' + otherName + ')' : ''}
+                        {classLabel(state, c)}{other && !on ? ' (' + otherName + ')' : ''}
                       </button>
                     );
                   })}
@@ -2344,7 +2375,7 @@ function FacultyProfile({ faculty, state, conflicts }) {
             <div key={e.id} className="flex items-center justify-between rounded-lg border px-3 py-2 text-sm" style={{ borderColor: isConflicted ? T.critical : T.border, background: isConflicted ? T.criticalTint : 'transparent' }}>
               <div>
                 <p className="font-medium" style={{ color: T.ink }}>{d?.actualDay}, {p?.label}</p>
-                <p className="text-xs" style={{ color: T.muted }}>{c?.departmentId} {c?.year}-{c?.section} {'\u00b7'} {s?.name}</p>
+                <p className="text-xs" style={{ color: T.muted }}>{classLabel(state, c)} {'\u00b7'} {s?.name}</p>
               </div>
               {isConflicted && <AlertTriangle size={15} color={T.critical} />}
             </div>
@@ -2357,9 +2388,9 @@ function FacultyProfile({ faculty, state, conflicts }) {
 
 function CreateTimetable({ state, actions, conflicts }) {
   const [departmentId, setDepartmentId] = useState(state.departments[0]?.id || '');
-  const [batch, setBatch] = useState('2024\u20132028');
+  const [batchEdit, setBatchEdit] = useState(null);
   const [year, setYear] = useState('III');
-  const [section, setSection] = useState('A');
+  const [sectionPick, setSectionPick] = useState('A');
   const [roomId, setRoomId] = useState('');
   const [confirmed, setConfirmed] = useState(false);
   const [cell, setCell] = useState(null);
@@ -2374,16 +2405,31 @@ function CreateTimetable({ state, actions, conflicts }) {
   const stateRef = useRef(state); stateRef.current = state;
   const actionsRef = useRef(actions); actionsRef.current = actions;
 
+  // ---- Which class is this? The Section box is only shown when this department + year really has
+  // 2 or more classes. With one class there is nothing to choose, so it is used automatically.
+  const yearSections = state.classSections
+    .filter((c) => c.departmentId === departmentId && c.year === year)
+    .sort((a, b) => String(a.section).localeCompare(String(b.section)));
+  const multiSection = yearSections.length > 1;
+  const section = multiSection
+    ? (yearSections.some((c) => c.section === sectionPick) ? sectionPick : yearSections[0].section)
+    : (yearSections[0]?.section || 'A');
+  const existingClass = yearSections.find((c) => c.section === section);
+  // an existing class keeps its own batch; a new one gets it from the year + academic year
+  const batch = existingClass ? existingClass.batch : (batchEdit ?? batchForYear(state, year));
+
   const classSection = useMemo(() => {
     if (!confirmed) return null;
     let cs = state.classSections.find((c) => c.departmentId === departmentId && c.year === year && c.section === section);
     return cs;
   }, [confirmed, state.classSections, departmentId, year, section]);
 
+  const classTitle = classSection ? classLabel(state, classSection) : departmentId + ' ' + year;
+
   function ensureClassSection() {
     let cs = state.classSections.find((c) => c.departmentId === departmentId && c.year === year && c.section === section);
     if (!cs) {
-      cs = { id: uid('CLS'), departmentId, batch, year, semester: 5, section, roomId: roomId || null };
+      cs = { id: uid('CLS'), departmentId, batch, year, semester: semesterForYear(year), section, roomId: roomId || null };
       actions.addRecord('classSections', cs, 'Class section created: ' + departmentId + ' ' + year + '-' + section);
     }
     setConfirmed(true);
@@ -2430,7 +2476,7 @@ function CreateTimetable({ state, actions, conflicts }) {
     const dropIds = new Set(removeEntryIds);
     const cleaned = dropIds.size ? 'Removed ' + dropIds.size + ' broken period(s). ' : '';
     if (entries.length > 0 || dropIds.size > 0) {
-      const label = scope === 'department' ? departmentId + ' (' + targets.length + ' classes)' : departmentId + ' ' + year + section;
+      const label = scope === 'department' ? departmentId + ' (' + targets.length + ' classes)' : classTitle;
       actions.persist(actions.logActivity(
         { ...state, timetableEntries: [...state.timetableEntries.filter((e) => !dropIds.has(e.id)), ...entries] },
         'Auto-generated ' + entries.length + ' period(s) for ' + label,
@@ -2468,7 +2514,7 @@ function CreateTimetable({ state, actions, conflicts }) {
         setUndoSnap(live.timetableEntries.filter((e) => e.classSectionId === cs.id));
         actionsRef.current.persist(actionsRef.current.logActivity(
           { ...live, timetableEntries: entries },
-          'Timetable changed by request: ' + departmentId + ' ' + year + section,
+          'Timetable changed by request: ' + classTitle,
           { entityType: 'timetable', entityId: departmentId },
         ));
         setChangeText('');
@@ -2486,7 +2532,7 @@ function CreateTimetable({ state, actions, conflicts }) {
     const live = stateRef.current;
     actionsRef.current.persist(actionsRef.current.logActivity(
       { ...live, timetableEntries: [...live.timetableEntries.filter((e) => e.classSectionId !== classSection.id), ...undoSnap] },
-      'Change undone: ' + departmentId + ' ' + year + section,
+      'Change undone: ' + classTitle,
       { entityType: 'timetable', entityId: departmentId },
     ));
     setUndoSnap(null);
@@ -2499,7 +2545,7 @@ function CreateTimetable({ state, actions, conflicts }) {
     if (!bad.size) return;
     actions.persist(actions.logActivity(
       { ...state, timetableEntries: state.timetableEntries.filter((e) => !bad.has(e.id)) },
-      'Removed ' + bad.size + ' broken period(s): ' + departmentId + ' ' + year + section,
+      'Removed ' + bad.size + ' broken period(s): ' + classTitle,
       { entityType: 'timetable', entityId: departmentId },
     ));
     actions.toast('Removed ' + bad.size + ' broken period(s). Auto-fill can now use those cells.', 'success');
@@ -2507,10 +2553,10 @@ function CreateTimetable({ state, actions, conflicts }) {
 
   function clearClass() {
     if (!classSection || entriesForClass.length === 0) return;
-    if (!window.confirm('Remove all ' + entriesForClass.length + ' period(s) of ' + departmentId + ' ' + year + section + '? This cannot be undone.')) return;
+    if (!window.confirm('Remove all ' + entriesForClass.length + ' period(s) of ' + classTitle + '? This cannot be undone.')) return;
     actions.persist(actions.logActivity(
       { ...state, timetableEntries: state.timetableEntries.filter((e) => e.classSectionId !== classSection.id) },
-      'Timetable cleared for ' + departmentId + ' ' + year + section,
+      'Timetable cleared for ' + classTitle,
       { entityType: 'timetable', entityId: departmentId },
     ));
     actions.toast('Class timetable cleared.');
@@ -2544,7 +2590,7 @@ function CreateTimetable({ state, actions, conflicts }) {
           ...liveState,
           timetableEntries: [...liveState.timetableEntries, ...entries],
         };
-        liveActions.persist(liveActions.logActivity(next, 'AI generated ' + entries.length + ' slot(s) for ' + departmentId + ' ' + year + section, { entityType: 'timetable', entityId: departmentId }));
+        liveActions.persist(liveActions.logActivity(next, 'AI generated ' + entries.length + ' slot(s) for ' + classTitle, { entityType: 'timetable', entityId: departmentId }));
       }
 
       if (entries.length === 0 && skipped.length === 0) {
@@ -2593,23 +2639,25 @@ function CreateTimetable({ state, actions, conflicts }) {
       </div>
 
       <Card className="mb-5 p-4">
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+        <div className={'grid grid-cols-2 gap-3 ' + (multiSection ? 'sm:grid-cols-5' : 'sm:grid-cols-4')}>
           <Field label="Department">
-            <Select value={departmentId} onChange={(e) => { setDepartmentId(e.target.value); setConfirmed(false); }}>
+            <Select value={departmentId} onChange={(e) => { setDepartmentId(e.target.value); setBatchEdit(null); setConfirmed(false); }}>
               {state.departments.map((d) => <option key={d.id} value={d.id}>{d.id}</option>)}
             </Select>
           </Field>
-          <Field label="Batch"><Input value={batch} onChange={(e) => setBatch(e.target.value)} /></Field>
+          <Field label="Batch"><Input value={batch} disabled={!!existingClass} onChange={(e) => setBatchEdit(e.target.value)} title={existingClass ? 'Batch of the existing class' : 'Set from the year and the academic year'} /></Field>
           <Field label="Year">
-            <Select value={year} onChange={(e) => { setYear(e.target.value); setConfirmed(false); }}>
+            <Select value={year} onChange={(e) => { setYear(e.target.value); setBatchEdit(null); setConfirmed(false); }}>
               {['I', 'II', 'III', 'IV'].map((y) => <option key={y} value={y}>{y}</option>)}
             </Select>
           </Field>
-          <Field label="Section">
-            <Select value={section} onChange={(e) => { setSection(e.target.value); setConfirmed(false); }}>
-              {[...new Set([...SECTION_LETTERS.slice(0, 3), ...state.classSections.filter((c) => c.departmentId === departmentId).map((c) => c.section)])].sort().map((s) => <option key={s} value={s}>{s}</option>)}
-            </Select>
-          </Field>
+          {multiSection && (
+            <Field label="Section">
+              <Select value={section} onChange={(e) => { setSectionPick(e.target.value); setConfirmed(false); }}>
+                {yearSections.map((c) => <option key={c.id} value={c.section}>{c.section}</option>)}
+              </Select>
+            </Field>
+          )}
           <Field label="Lecture hall">
             <Select value={roomId} onChange={(e) => setRoomId(e.target.value)}>
               <option value="">Select room</option>
@@ -2619,6 +2667,11 @@ function CreateTimetable({ state, actions, conflicts }) {
         </div>
         <div className="mt-4">
           <PrimaryButton onClick={ensureClassSection}>{confirmed ? 'Class loaded' : 'Load class'}</PrimaryButton>
+          {yearSections.length === 0 && (
+            <p className="mt-2 text-xs" style={{ color: T.muted }}>
+              {departmentId} has no {year} year class yet. "Load class" creates it as a single class. For sections A, B, C use Master Data {'\u2192'} Departments {'\u2192'} Add classes.
+            </p>
+          )}
         </div>
       </Card>
 
@@ -2658,7 +2711,7 @@ function CreateTimetable({ state, actions, conflicts }) {
 
           <Card className="overflow-x-auto p-4">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-              <p className="ts-display text-sm font-semibold" style={{ color: T.ink }}>{departmentId} {'\u2013'} {year} {section} timetable grid</p>
+              <p className="ts-display text-sm font-semibold" style={{ color: T.ink }}>{classTitle} timetable grid</p>
               <div className="flex items-center gap-2">
                 <PrimaryButton icon={Sparkles} onClick={() => autoFill('class')} disabled={aiBusy}>Auto-fill this class</PrimaryButton>
                 <GhostButton onClick={() => autoFill('department')} disabled={aiBusy}>Auto-fill all {departmentId} classes</GhostButton>
@@ -2764,7 +2817,7 @@ function CreateTimetable({ state, actions, conflicts }) {
           </Card>
 
           <div className="mt-5">
-            <ExportToolbar state={state} classSection={classSection} entries={entriesForClass} departmentId={departmentId} year={year} section={section} batch={batch} toast={actions.toast} />
+            <ExportToolbar state={state} classSection={classSection} entries={entriesForClass} departmentId={departmentId} year={year} section={multiSection ? section : ''} batch={batch} toast={actions.toast} />
           </div>
         </>
       )}
@@ -2844,7 +2897,7 @@ function ClassAllocationPanel({ state, actions, classSection: cs }) {
     const others = (state.classAssignments || []).filter((a) => a.classSectionId !== cs.id);
     actions.persist(actions.logActivity(
       { ...state, classAssignments: [...others, ...next] },
-      'Class allocation saved: ' + cs.departmentId + ' ' + cs.year + cs.section + ' (' + next.length + ' subject(s))',
+      'Class allocation saved: ' + classLabel(state, cs) + ' (' + next.length + ' subject(s))',
       { entityType: 'timetable', entityId: cs.departmentId },
     ));
     actions.toast('Class allocation saved. Auto-fill will now use exactly this staff.', 'success');
@@ -2854,7 +2907,7 @@ function ClassAllocationPanel({ state, actions, classSection: cs }) {
     <Card className="mb-5 p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <p className="ts-display text-sm font-semibold" style={{ color: T.ink }}>Class allocation {'\u2014'} who teaches what in {cs.departmentId} {cs.year}-{cs.section}</p>
+          <p className="ts-display text-sm font-semibold" style={{ color: T.ink }}>Class allocation {'\u2014'} who teaches what in {classLabel(state, cs)}</p>
           <p className="text-xs" style={{ color: T.muted }}>
             {saved.length ? saved.length + ' subject(s) allocated to this section.' : 'Not saved yet \u2014 auto-fill uses any eligible teacher until you save this.'}
           </p>
@@ -2868,8 +2921,8 @@ function ClassAllocationPanel({ state, actions, classSection: cs }) {
             {otherSections.length > 0 && (
               <>
                 <Select value={copyFrom} onChange={(e) => setCopyFrom(e.target.value)}>
-                  <option value="">Copy from another section{'\u2026'}</option>
-                  {otherSections.map((c) => <option key={c.id} value={c.id}>{c.departmentId} {c.year}-{c.section}</option>)}
+                  <option value="">Copy from another class{'\u2026'}</option>
+                  {otherSections.map((c) => <option key={c.id} value={c.id}>{classLabel(state, c)}</option>)}
                 </Select>
                 <GhostButton onClick={copy} disabled={!copyFrom}>Copy</GhostButton>
               </>
@@ -3113,7 +3166,7 @@ function drawTimetableCanvas({ state, entries, subjectRows, room, department, de
     ctx.fillText(String(vb ?? ''), c4, y);
     y += rowH;
   }
-  infoRow('Batch', batch, 'Year/Sem', year + ' / ' + section);
+  infoRow('Batch', batch, 'Year/Sem', year + (section ? ' / ' + section : ''));
   infoRow('Academic Year', state.college?.academicYear, 'Lecture Hall', room?.name || 'Not Assigned');
   ctx.font = 'bold 12px Arial';
   ctx.fillText('Degree / Branch', c1, y);
@@ -3292,7 +3345,7 @@ function ExportToolbar({ state, classSection, entries, departmentId, year, secti
   return (
     <Card className="p-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="text-sm" style={{ color: T.muted }}>Export the {departmentId} {year}-{section} timetable for distribution.</p>
+        <p className="text-sm" style={{ color: T.muted }}>Export the {classLabel(state, classSection)} timetable for distribution.</p>
         <div className="no-print flex gap-2">
           <GhostButton icon={FileText} onClick={() => handleDownload('pdf')} disabled={busy !== null}>
             {busy === 'pdf' ? 'Generating\u2026' : 'Download PDF'}
@@ -3307,7 +3360,7 @@ function ExportToolbar({ state, classSection, entries, departmentId, year, secti
   );
 }
 
-function ConflictCard({ c, onView, highlightId }) {
+function ConflictCard({ c, state, onView, highlightId }) {
   const [flashing, ref] = useFlashHighlight(highlightId, c.id);
   return (
     <Card ref={ref} className="p-4" style={{ borderColor: T.critical, boxShadow: flashing ? `0 0 0 2px ${T.critical}` : 'none' }}>
@@ -3317,7 +3370,7 @@ function ConflictCard({ c, onView, highlightId }) {
       </div>
       {c.type === 'faculty' && <p className="text-sm font-semibold" style={{ color: T.ink }}>{c.fac?.name}</p>}
       <p className="mt-1 text-sm" style={{ color: T.ink }}>
-        {c.classA?.departmentId} {c.classA?.year}-{c.classA?.section} <ArrowRight size={11} className="mx-1 inline" /> vs <ArrowRight size={11} className="mx-1 inline" /> {c.classB?.departmentId} {c.classB?.year}-{c.classB?.section}
+        {classLabel(state, c.classA)} <ArrowRight size={11} className="mx-1 inline" /> vs <ArrowRight size={11} className="mx-1 inline" /> {classLabel(state, c.classB)}
       </p>
       <p className="mt-1 text-xs" style={{ color: T.muted }}>{c.dayOrder?.actualDay} {'\u00b7'} {c.period?.label}</p>
       <div className="mt-3 flex gap-2">
@@ -3350,7 +3403,7 @@ function ConflictCenter({ state, actions, conflicts, highlightId = null }) {
       ) : (
         <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
           {filtered.map((c) => (
-            <ConflictCard key={c.id} c={c} onView={setResolveTarget} highlightId={highlightId} />
+            <ConflictCard key={c.id} c={c} state={state} onView={setResolveTarget} highlightId={highlightId} />
           ))}
         </div>
       )}
@@ -3375,11 +3428,11 @@ function ResolveConflictPanel({ state, actions, conflict, onClose }) {
       <div className="mb-4 space-y-2 text-sm">
         <div className="rounded-lg border px-3 py-2" style={{ borderColor: T.border }}>
           <p className="text-xs font-semibold" style={{ color: T.muted }}>Existing assignment</p>
-          <p style={{ color: T.ink }}>{conflict.classA?.departmentId} {conflict.classA?.year}-{conflict.classA?.section} {'\u00b7'} {conflict.subjA?.name}</p>
+          <p style={{ color: T.ink }}>{classLabel(state, conflict.classA)} {'\u00b7'} {conflict.subjA?.name}</p>
         </div>
         <div className="rounded-lg border px-3 py-2" style={{ borderColor: T.critical, background: T.criticalTint }}>
           <p className="text-xs font-semibold" style={{ color: T.critical }}>Conflicting attempt</p>
-          <p style={{ color: T.ink }}>{conflict.classB?.departmentId} {conflict.classB?.year}-{conflict.classB?.section} {'\u00b7'} {conflict.subjB?.name}</p>
+          <p style={{ color: T.ink }}>{classLabel(state, conflict.classB)} {'\u00b7'} {conflict.subjB?.name}</p>
         </div>
       </div>
 
@@ -3417,56 +3470,153 @@ function ResolveConflictPanel({ state, actions, conflict, onClose }) {
   );
 }
 
+// One class's full timetable, read-only, laid out exactly like the grid on Create Timetable:
+// subject, teacher and room in every box, conflicts in red, plus a coverage strip.
+function ClassTimetableCard({ state, conflicts, cs }) {
+  const periodSlots = state.periods.filter((p) => p.type === 'period');
+  const entries = state.timetableEntries.filter((e) => e.classSectionId === cs.id);
+  const room = cs.roomId ? state.classrooms.find((r) => r.id === cs.roomId) : null;
+  const coverage = coverageForClass(state, cs);
+  const required = coverage.filter((c) => !c.stray && !c.broken).reduce((s, c) => s + c.required, 0);
+  const classConflicts = entries.filter((e) => conflicts.some((c) => c.entryA.id === e.id || c.entryB.id === e.id)).length;
+
+  return (
+    <Card className="overflow-x-auto p-4">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <p className="ts-display text-sm font-semibold" style={{ color: T.ink }}>{classLabel(state, cs)} timetable</p>
+          <p className="text-xs" style={{ color: T.muted }}>
+            {cs.batch ? 'Batch ' + cs.batch + ' \u00b7 ' : ''}Semester {cs.semester}{room ? ' \u00b7 Room ' + room.name : ''}
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge tone={entries.length === 0 ? 'gray' : required && entries.length >= required ? 'success' : 'warn'}>
+            {entries.length}{required ? ' / ' + required : ''} periods
+          </Badge>
+          {classConflicts > 0 && <Badge tone="critical">{classConflicts} in conflict</Badge>}
+        </div>
+      </div>
+
+      {entries.length === 0 ? (
+        <p className="rounded-lg border border-dashed px-3 py-4 text-center text-xs" style={{ borderColor: T.border, color: T.muted }}>
+          No periods scheduled yet. Build it in Create Timetable {'\u2192'} Auto-fill.
+        </p>
+      ) : (
+        <>
+          <table className="w-full min-w-[720px] table-fixed border-collapse text-xs">
+            <thead>
+              <tr>
+                <th className="w-16 border p-2 text-left font-semibold" style={{ borderColor: T.border, color: T.muted, background: T.bg }}>Day order</th>
+                {periodSlots.map((p) => (
+                  <th key={p.id} className="border p-2 text-center font-semibold" style={{ borderColor: T.border, color: T.muted, background: T.bg }}>
+                    <div>{p.label}</div>
+                    <div className="ts-mono font-normal">{p.start}</div>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {state.dayOrders.map((d) => (
+                <tr key={d.id}>
+                  <td className="border p-2 text-center" style={{ borderColor: T.border }}>
+                    <div className="ts-mono font-bold" style={{ color: T.primary }}>{d.label}</div>
+                    <div className="text-[10px]" style={{ color: T.muted }}>{String(d.actualDay || '').slice(0, 3)}</div>
+                  </td>
+                  {periodSlots.map((p) => {
+                    const entry = entries.find((e) => e.dayOrderId === d.id && e.periodId === p.id);
+                    const isConflicted = entry && conflicts.some((c) => c.entryA.id === entry.id || c.entryB.id === entry.id);
+                    const subj = entry && state.subjects.find((s) => s.id === entry.subjectId);
+                    const fac = entry && state.faculty.find((f) => f.id === entry.facultyId);
+                    const rm = entry?.roomId ? state.classrooms.find((r) => r.id === entry.roomId) || state.labs.find((r) => r.id === entry.roomId) : null;
+                    const broken = entry && (!subj || !fac);
+                    return (
+                      <td key={p.id} className="border p-1.5 align-top" style={{ borderColor: isConflicted || broken ? T.critical : T.border, background: isConflicted || broken ? T.criticalTint : 'transparent' }}>
+                        {entry ? (
+                          <div>
+                            <p className="font-semibold" style={{ color: T.ink }}>{subj ? subj.name : 'Subject deleted'}</p>
+                            <p style={{ color: T.muted }}>{fac ? fac.name : 'Faculty missing'}</p>
+                            <p className="ts-mono" style={{ color: T.muted }}>{rm ? rm.name : '-'}</p>
+                            {entry.type === 'lab' && <span className="mt-0.5 inline-block rounded px-1 text-[10px] font-semibold" style={{ background: T.primaryTint, color: T.primary }}>Lab</span>}
+                          </div>
+                        ) : (
+                          <span style={{ color: T.muted }}>{'\u2014'}</span>
+                        )}
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-3 flex flex-wrap gap-1.5">
+            {coverage.map((c) => {
+              const bad = c.stray || c.broken || c.scheduled > c.required;
+              const color = bad ? T.critical : c.scheduled === c.required ? T.success : T.warn;
+              return (
+                <span key={c.subjectId} className="rounded-full border px-2.5 py-0.5 text-xs" style={{ borderColor: color, color }}>
+                  {c.broken ? c.name + ' \u00d7' + c.scheduled : c.stray ? c.name + ' \u00d7' + c.scheduled + ' (not in plan)' : c.name + ' ' + c.scheduled + '/' + c.required}
+                </span>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
+
 function TimetableOverview({ state, conflicts, initialDept = 'ALL' }) {
   const [dept, setDept] = useState(initialDept);
+  const [year, setYear] = useState('ALL');
+  const [hideEmpty, setHideEmpty] = useState(false);
   useEffect(() => { setDept(initialDept); }, [initialDept]);
-  const departments = dept === 'ALL' ? state.departments : state.departments.filter((d) => d.id === dept);
-  const periodSlots = state.periods.filter((p) => p.type === 'period');
+
+  // Every CLASS gets its own grid. (The old page merged all classes of a department into one
+  // grid and showed only the first class found in each box, so with sections A and B - or two
+  // years - most periods were hidden, and it never showed teacher or room.)
+  const classes = state.classSections
+    .filter((c) => (dept === 'ALL' || c.departmentId === dept) && (year === 'ALL' || c.year === year))
+    .filter((c) => !hideEmpty || state.timetableEntries.some((e) => e.classSectionId === c.id))
+    .sort((a, b) =>
+      (state.departments.findIndex((d) => d.id === a.departmentId) - state.departments.findIndex((d) => d.id === b.departmentId))
+      || (YEAR_OPTIONS.indexOf(a.year) - YEAR_OPTIONS.indexOf(b.year))
+      || String(a.section).localeCompare(String(b.section)));
+  const departments = state.departments.filter((d) => classes.some((c) => c.departmentId === d.id));
 
   return (
     <div>
-      <div className="mb-4 flex flex-wrap gap-2">
+      <div className="mb-4 flex flex-wrap items-center gap-3">
         <Select value={dept} onChange={(e) => setDept(e.target.value)} className="w-48">
           <option value="ALL">All departments</option>
           {state.departments.map((d) => <option key={d.id} value={d.id}>{d.id}</option>)}
         </Select>
+        <Select value={year} onChange={(e) => setYear(e.target.value)} className="w-36">
+          <option value="ALL">All years</option>
+          {YEAR_OPTIONS.map((y) => <option key={y} value={y}>{y} year</option>)}
+        </Select>
+        <label className="flex items-center gap-1.5 text-xs" style={{ color: T.muted }}>
+          <input type="checkbox" checked={hideEmpty} onChange={(e) => setHideEmpty(e.target.checked)} /> hide classes with no timetable
+        </label>
+        <span className="text-xs" style={{ color: T.muted }}>{classes.length} class(es) {'\u00b7'} read-only view, edit in Create Timetable</span>
       </div>
 
-      <div className="space-y-6">
-        {departments.map((d) => {
-          const entries = state.timetableEntries.filter((e) => e.departmentId === d.id);
-          if (entries.length === 0) return null;
-          return (
-            <Card key={d.id} className="overflow-x-auto p-4">
-              <p className="ts-display mb-3 text-sm font-semibold" style={{ color: T.ink }}>{d.id} {'\u2014'} {d.name}</p>
-              <table className="w-full min-w-[640px] table-fixed border-collapse text-xs">
-                <thead>
-                  <tr>
-                    <th className="w-14 border p-1.5 text-left" style={{ borderColor: T.border, color: T.muted, background: T.bg }}>DO</th>
-                    {periodSlots.map((p) => <th key={p.id} className="border p-1.5" style={{ borderColor: T.border, color: T.muted, background: T.bg }}>{p.label}</th>)}
-                  </tr>
-                </thead>
-                <tbody>
-                  {state.dayOrders.map((doRow) => (
-                    <tr key={doRow.id}>
-                      <td className="ts-mono border p-1.5 text-center font-bold" style={{ borderColor: T.border, color: T.primary }}>{doRow.label}</td>
-                      {periodSlots.map((p) => {
-                        const entry = entries.find((e) => e.dayOrderId === doRow.id && e.periodId === p.id);
-                        const isConflicted = entry && conflicts.some((c) => c.entryA.id === entry.id || c.entryB.id === entry.id);
-                        const subj = entry && state.subjects.find((s) => s.id === entry.subjectId);
-                        return (
-                          <td key={p.id} className="border p-1.5 align-top" style={{ borderColor: isConflicted ? T.critical : T.border, background: isConflicted ? T.criticalTint : 'transparent' }}>
-                            {subj ? <span style={{ color: T.ink }}>{subj.name}</span> : <span style={{ color: T.muted }}>{'\u2014'}</span>}
-                          </td>
-                        );
-                      })}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </Card>
-          );
-        })}
+      {classes.length === 0 && (
+        <Card className="p-6 text-center text-sm" style={{ color: T.muted }}>
+          No classes to show. Create classes in Master Data {'\u2192'} Departments, then build their timetables in Create Timetable.
+        </Card>
+      )}
+
+      <div className="space-y-8">
+        {departments.map((d) => (
+          <section key={d.id}>
+            <p className="ts-display mb-3 text-sm font-semibold" style={{ color: T.ink }}>{d.id} {'\u2014'} {d.name}</p>
+            <div className="space-y-5">
+              {classes.filter((c) => c.departmentId === d.id).map((c) => (
+                <ClassTimetableCard key={c.id} state={state} conflicts={conflicts} cs={c} />
+              ))}
+            </div>
+          </section>
+        ))}
       </div>
     </div>
   );
@@ -3574,6 +3724,7 @@ function ScheduleAnalytics({ state, conflicts }) {
 
 function SettingsPage({ state, actions }) {
   const [confirmingReset, setConfirmingReset] = useState(false);
+  const [resetText, setResetText] = useState('');
   function exportData() {
     try {
       const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
@@ -3585,7 +3736,7 @@ function SettingsPage({ state, actions }) {
       URL.revokeObjectURL(url);
       actions.toast('Data exported.');
     } catch (e) {
-      actions.toast('Export is unavailable in this preview.', 'critical');
+      actions.toast('Could not export the data. Try again.', 'critical');
     }
   }
 
@@ -3609,21 +3760,36 @@ function SettingsPage({ state, actions }) {
             <GhostButton icon={RefreshCw} tone="critical" onClick={() => setConfirmingReset(true)}>Reset demo data</GhostButton>
           ) : (
             <>
-              <span className="text-xs font-medium" style={{ color: T.critical }}>This clears every change you have made.</span>
-              <PrimaryButton onClick={() => { actions.resetDemoData(); setConfirmingReset(false); }}>Confirm reset</PrimaryButton>
-              <GhostButton onClick={() => setConfirmingReset(false)}>Cancel</GhostButton>
+              <span className="text-xs font-medium" style={{ color: T.critical }}>
+                This DELETES all real college data (departments, classes, faculty, subjects, timetables) from the database and replaces it with sample data. Type RESET to confirm.
+              </span>
+              <Input value={resetText} onChange={(e) => setResetText(e.target.value)} placeholder="RESET" className="w-28" />
+              <PrimaryButton disabled={resetText !== 'RESET'} onClick={() => { actions.resetDemoData(); setConfirmingReset(false); setResetText(''); }}>Confirm reset</PrimaryButton>
+              <GhostButton onClick={() => { setConfirmingReset(false); setResetText(''); }}>Cancel</GhostButton>
             </>
           )}
         </div>
       </Card>
 
       <Card className="p-5 lg:col-span-2">
-        <p className="ts-display mb-1 text-sm font-semibold" style={{ color: T.ink }}>About this prototype</p>
-        <p className="text-sm" style={{ color: T.muted }}>
-          Time Sync AI runs entirely in your browser for this preview {'\u2014'} all data is stored privately to your account and persists between visits.
-          Conflict detection is fully deterministic (same faculty, room, or class in the same Day Order and Period). PDF and PNG downloads
-          are rendered directly with a canvas-based drawer plus jsPDF, so exports don{'\u2019'}t depend on screenshotting the page.
-        </p>
+        <p className="ts-display mb-1 text-sm font-semibold" style={{ color: T.ink }}>About Time Sync AI</p>
+        <div className="space-y-2 text-sm" style={{ color: T.muted }}>
+          <p>
+            Your college{'\u2019'}s master data and timetables are kept in a shared cloud database (Supabase), so everyone sees the same
+            timetable. Anyone can view; you must sign in to add, edit or delete.
+          </p>
+          <p>
+            <strong style={{ color: T.ink }}>Auto-fill</strong> runs inside the app with no AI call. A teacher, room or class is never in two places in the same Day Order and Period
+            (across every department), teacher availability and weekly-hour limits are respected, and labs get consecutive periods.
+            Conflict detection is fully deterministic. Common subjects taught by the same teacher to different departments in one slot count as one combined class, not a clash.
+          </p>
+          <p>
+            <strong style={{ color: T.ink }}>Change by comment</strong>: {isGrokConfigured()
+              ? 'enabled. The AI only turns your sentence into a change; the app applies it and re-checks every rule.'
+              : 'not enabled. Add VITE_GROK_API_KEY to turn it on (everything else works without it).'}
+          </p>
+          <p>PDF and PNG downloads are drawn directly with a canvas and jsPDF, so they don{'\u2019'}t depend on screenshots of the page.</p>
+        </div>
       </Card>
     </div>
   );
