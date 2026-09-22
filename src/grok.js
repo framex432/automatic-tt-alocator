@@ -134,14 +134,16 @@ export function buildPrompt({ state, departmentId, classSection, deptSubjects, p
   }
 
   const system = `You are a timetable scheduling engine. Reply with ONE JSON array and nothing else (no markdown, no prose).
-Each item: ["<day>","<period>","<subjectId>","<facultyId>","<roomId or null>"]  (day/period are the two halves of a "free" cell "DAY:PERIOD").
+Each item: ["<cell>","<subjectId>","<facultyId>","<roomId or null>"]
+"<cell>" must be copied EXACTLY, character-for-character, from the "free" list below (e.g. "${free[0] || 'DO1:P1'}") \u2014 never split it into two fields, never reformat it, never invent your own.
 Rules:
 1. Use only cells listed in "free", each at most once.
 2. A subject may be placed at most "need" times. subject.fac lists the only allowed faculty. Prefer ONE faculty per subject.
 3. Never use a faculty at a cell listed for them in busyF, never a room at a cell listed in busyR, never a faculty on a day in their "off" list.
 4. A faculty can be used at most "left" times in total.
 5. Subjects with t="L" (lab) need 2 (or 3) CONSECUTIVE periods on the same day, in a room with t="lab" if any. Theory subjects use t="room" rooms. If no room fits, use null.
-6. Spread each subject over different days. Leaving cells empty is fine. Never invent ids.`;
+6. Spread each subject over different days. Leaving cells empty is fine. Never invent ids.
+Example item using a real free cell from this request: ["${free[0] || 'DO1:P1'}","<subjectId>","<facultyId>",null]`;
 
   const user = JSON.stringify({
     cls: departmentId + '-' + classSection.year + '-' + classSection.section,
@@ -205,13 +207,36 @@ function extractJsonArray(text) {
   return JSON.parse(cleaned.slice(start, end + 1));
 }
 
-// accepts the compact tuple form AND the old object form
+// The model is asked for the compact 4-field tuple ["cell","subjectId","facultyId","roomId"]
+// where "cell" is one of the exact "DAY:PERIOD" strings from the prompt's "free" list. This
+// also accepts the older 5-field split tuple ["day","period","subjectId","facultyId","roomId"],
+// and self-heals the specific mistake seen in practice - the model pasting the whole "DAY:PERIOD"
+// cell string into slot 0 of what it thinks is the split form, which used to silently shift every
+// field over by one and made every row fail as "unknown day/period" + "unknown subject".
+function splitCell(cell) {
+  if (typeof cell !== 'string') return null;
+  const i = cell.indexOf(':');
+  return i === -1 ? null : [cell.slice(0, i), cell.slice(i + 1)];
+}
+
 function normalizeItem(item) {
   if (Array.isArray(item)) {
-    const [dayOrderId, periodId, subjectId, facultyId, roomId] = item;
-    return { dayOrderId, periodId, subjectId, facultyId, roomId };
+    if (item.length <= 4) {
+      const [cell, subjectId, facultyId, roomId] = item;
+      const split = splitCell(cell);
+      const [dayOrderId, periodId] = split || [cell, undefined];
+      return { dayOrderId, periodId, subjectId, facultyId, roomId };
+    }
+    const [a, b, subjectId, facultyId, roomId] = item;
+    const split = splitCell(a);
+    return split ? { dayOrderId: split[0], periodId: split[1], subjectId, facultyId, roomId } : { dayOrderId: a, periodId: b, subjectId, facultyId, roomId };
   }
-  return item || {};
+  if (item && typeof item === 'object') {
+    const split = splitCell(item.cell);
+    if (split) return { dayOrderId: split[0], periodId: split[1], subjectId: item.subjectId, facultyId: item.facultyId, roomId: item.roomId ?? null };
+    return item;
+  }
+  return {};
 }
 
 // ---------------------------------------------------------------------------

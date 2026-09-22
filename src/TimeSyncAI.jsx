@@ -228,6 +228,23 @@ function aiSuggestions(entry, state) {
   return options;
 }
 
+// Faculty other than the one currently booked who can ALSO teach this subject
+// (subject.facultyIds) and are free at this exact day/period across the whole
+// college. Unlike aiSuggestions (which needs an empty CELL for the whole class,
+// impossible once a class's grid is completely full), this needs no free cell
+// at all - it just swaps who teaches the already-scheduled slot, so it still
+// works when the class has zero spare periods.
+function alternateFacultyOptions(entry, subject, state) {
+  if (!subject) return [];
+  const day = state.dayOrders.find((d) => d.id === entry.dayOrderId);
+  return (subject.facultyIds || [])
+    .filter((id) => id !== entry.facultyId)
+    .map((id) => state.faculty.find((f) => f.id === id))
+    .filter(Boolean)
+    .filter((f) => !(Array.isArray(f.availability) && day && !f.availability.includes(day.actualDay)))
+    .filter((f) => !state.timetableEntries.some((e) => e.id !== entry.id && e.facultyId === f.id && e.dayOrderId === entry.dayOrderId && e.periodId === entry.periodId));
+}
+
 function timeAgo(ts) {
   const diff = Math.max(0, Date.now() - ts);
   const min = Math.floor(diff / 60000);
@@ -518,6 +535,10 @@ function TimeSyncAIInner() {
   const [facultyDeptFilter, setFacultyDeptFilter] = useState('ALL');
   const [masterTab, setMasterTab] = useState('College');
   const [overviewDept, setOverviewDept] = useState('ALL');
+  // Set when "Edit" is clicked on a class's card in Timetable Overview, so Create
+  // Timetable opens with that exact class (department + year + section) pre-selected
+  // and confirmed instead of landing on its blank "Select class" step.
+  const [editClassTarget, setEditClassTarget] = useState(null);
   // focusEntity tracks which specific record a search result / notification pointed at,
   // so the destination page can scroll to it and highlight it instead of just landing
   // on the module's default view.
@@ -698,9 +719,16 @@ function TimeSyncAIInner() {
     setFocusEntity(null);
   }, []);
 
+  // Jump to Create Timetable with one specific class (from its Timetable Overview
+  // card) pre-selected, instead of the usual blank "Select class" step.
+  const openClassForEdit = useCallback((cs) => {
+    setEditClassTarget({ departmentId: cs.departmentId, year: cs.year, section: cs.section });
+    setPage('createTimetable');
+  }, []);
+
   const actions = {
     addRecord, updateRecord, deleteRecord, updateCollege, resetDemoData, toast, persist, logActivity,
-    setPage, setGlobalFacultyId, setFacultyModalOpen, setFacultyDeptFilter, openEntity,
+    setPage, setGlobalFacultyId, setFacultyModalOpen, setFacultyDeptFilter, openEntity, openClassForEdit,
   };
 
   if (loading || !state) {
@@ -754,7 +782,7 @@ function TimeSyncAIInner() {
                 return (
                   <button
                     key={item.id}
-                    onClick={() => { setPage(item.id); setSidebarOpen(false); setFocusEntity(null); setOverviewDept('ALL'); }}
+                    onClick={() => { setPage(item.id); setSidebarOpen(false); setFocusEntity(null); setOverviewDept('ALL'); setEditClassTarget(null); }}
                     className="mb-0.5 flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm font-medium transition-colors"
                     style={{ background: active ? T.primaryTint : 'transparent', color: active ? T.primary : T.ink }}
                   >
@@ -918,9 +946,9 @@ function TimeSyncAIInner() {
               deptFilter={facultyDeptFilter} setDeptFilter={setFacultyDeptFilter}
             />
           )}
-          {page === 'createTimetable' && <CreateTimetable state={state} actions={actions} conflicts={conflicts} />}
+          {page === 'createTimetable' && <CreateTimetable state={state} actions={actions} conflicts={conflicts} initialClass={editClassTarget} />}
           {page === 'conflictCenter' && <ConflictCenter state={state} actions={actions} conflicts={conflicts} highlightId={focusEntity?.type === 'conflict' ? focusEntity.id : null} />}
-          {page === 'timetableOverview' && <TimetableOverview state={state} conflicts={conflicts} initialDept={overviewDept} />}
+          {page === 'timetableOverview' && <TimetableOverview state={state} conflicts={conflicts} initialDept={overviewDept} onEditClass={openClassForEdit} />}
           {page === 'workload' && <FacultyWorkload state={state} />}
           {page === 'analytics' && <ScheduleAnalytics state={state} conflicts={conflicts} />}
           {page === 'settings' && <SettingsPage state={state} actions={actions} />}
@@ -2386,13 +2414,15 @@ function FacultyProfile({ faculty, state, conflicts }) {
   );
 }
 
-function CreateTimetable({ state, actions, conflicts }) {
-  const [departmentId, setDepartmentId] = useState(state.departments[0]?.id || '');
+function CreateTimetable({ state, actions, conflicts, initialClass = null }) {
+  const [departmentId, setDepartmentId] = useState(initialClass?.departmentId || state.departments[0]?.id || '');
   const [batchEdit, setBatchEdit] = useState(null);
-  const [year, setYear] = useState('III');
-  const [sectionPick, setSectionPick] = useState('A');
+  const [year, setYear] = useState(initialClass?.year || 'III');
+  const [sectionPick, setSectionPick] = useState(initialClass?.section || 'A');
   const [roomId, setRoomId] = useState('');
-  const [confirmed, setConfirmed] = useState(false);
+  // Coming here via "Edit" on a class's card in Timetable Overview: that class already
+  // exists, so skip straight past the "Select class" step onto its schedule grid.
+  const [confirmed, setConfirmed] = useState(!!initialClass);
   const [cell, setCell] = useState(null);
   const [aiBusy, setAiBusy] = useState(false);
   const [changeText, setChangeText] = useState('');
@@ -3418,7 +3448,36 @@ function ConflictCenter({ state, actions, conflicts, highlightId = null }) {
 }
 
 function ResolveConflictPanel({ state, actions, conflict, onClose }) {
-  const suggestions = aiSuggestions(conflict.entryB, state);
+  // Try moving EITHER booking, not just the "conflicting attempt" - if class B's
+  // grid is completely full (0 free periods) but class A still has room, this is
+  // the only way a slot-move suggestion can be found at all.
+  const suggestionsB = aiSuggestions(conflict.entryB, state).map((opt) => ({ ...opt, entry: conflict.entryB, cls: conflict.classB, subj: conflict.subjB }));
+  const suggestionsA = aiSuggestions(conflict.entryA, state).map((opt) => ({ ...opt, entry: conflict.entryA, cls: conflict.classA, subj: conflict.subjA }));
+  const suggestions = [...suggestionsB, ...suggestionsA].slice(0, 3);
+
+  const altForB = conflict.type === 'faculty' ? alternateFacultyOptions(conflict.entryB, conflict.subjB, state) : [];
+  const altForA = conflict.type === 'faculty' ? alternateFacultyOptions(conflict.entryA, conflict.subjA, state) : [];
+
+  function applySlotMove(opt) {
+    const next = {
+      ...state,
+      timetableEntries: state.timetableEntries.map((e) => (e.id === opt.entry.id ? { ...e, dayOrderId: opt.dayOrderId, periodId: opt.periodId } : e)),
+    };
+    actions.persist(actions.logActivity(next, 'Conflict resolved for ' + (conflict.fac?.name || 'faculty'), { entityType: 'timetable', entityId: conflict.classA?.departmentId || conflict.classB?.departmentId || null }));
+    actions.toast('Conflict resolved.');
+    onClose();
+  }
+
+  function applyFacultyReassign(entry, faculty) {
+    const next = {
+      ...state,
+      timetableEntries: state.timetableEntries.map((e) => (e.id === entry.id ? { ...e, facultyId: faculty.id } : e)),
+    };
+    actions.persist(actions.logActivity(next, 'Conflict resolved \u2014 reassigned to ' + faculty.name, { entityType: 'timetable', entityId: conflict.classA?.departmentId || conflict.classB?.departmentId || null }));
+    actions.toast('Conflict resolved.');
+    onClose();
+  }
+
   return (
     <div>
       <div className="mb-4 rounded-lg border p-3" style={{ borderColor: T.critical, background: T.criticalTint }}>
@@ -3437,34 +3496,62 @@ function ResolveConflictPanel({ state, actions, conflict, onClose }) {
       </div>
 
       <p className="mb-2 flex items-center gap-1.5 text-sm font-semibold" style={{ color: T.ink }}><Sparkles size={14} color={T.primary} /> AI recommended resolutions</p>
-      <p className="mb-3 text-xs" style={{ color: T.muted }}>Deterministic slot search {'\u2014'} ranks the nearest conflict-free Day Order and Period for the second booking.</p>
+      <p className="mb-3 text-xs" style={{ color: T.muted }}>Deterministic slot search {'\u2014'} ranks the nearest conflict-free Day Order and Period for either booking.</p>
       <div className="space-y-2">
-        {suggestions.length === 0 && <p className="text-sm" style={{ color: T.muted }}>No conflict-free slot available this week.</p>}
+        {suggestions.length === 0 && (
+          <p className="text-sm" style={{ color: T.muted }}>
+            No conflict-free slot available this week for either class {'\u2014'} both grids are full, so freeing a slot means swapping the faculty below instead.
+          </p>
+        )}
         {suggestions.map((opt, i) => (
           <div key={i} className="flex items-center justify-between rounded-lg border px-3 py-2.5" style={{ borderColor: T.border }}>
             <div>
-              <p className="text-sm font-medium" style={{ color: T.ink }}>Move to {opt.dayLabel}, {opt.periodLabel}</p>
+              <p className="text-sm font-medium" style={{ color: T.ink }}>Move {classLabel(state, opt.cls)} {'\u00b7'} {opt.subj?.name} to {opt.dayLabel}, {opt.periodLabel}</p>
               <p className="text-xs" style={{ color: T.success }}>Conflict-free</p>
             </div>
-            <PrimaryButton
-              onClick={() => {
-                const next = {
-                  ...state,
-                  timetableEntries: state.timetableEntries.map((e) => (e.id === conflict.entryB.id ? { ...e, dayOrderId: opt.dayOrderId, periodId: opt.periodId } : e)),
-                };
-                actions.persist(actions.logActivity(next, 'Conflict resolved for ' + (conflict.fac?.name || 'faculty'), { entityType: 'timetable', entityId: conflict.classA?.departmentId || conflict.classB?.departmentId || null }));
-                actions.toast('Conflict resolved.');
-                onClose();
-              }}
-            >
-              Apply
-            </PrimaryButton>
+            <PrimaryButton onClick={() => applySlotMove(opt)}>Apply</PrimaryButton>
           </div>
         ))}
-        <div className="flex items-center justify-between rounded-lg border px-3 py-2.5" style={{ borderColor: T.border }}>
-          <p className="text-sm font-medium" style={{ color: T.ink }}>Assign another available faculty</p>
-          <GhostButton onClick={() => { actions.toast('Open the timetable grid to reassign faculty.'); onClose(); }}>Open grid</GhostButton>
-        </div>
+
+        {(altForB.length > 0 || altForA.length > 0) ? (
+          <>
+            {altForB.map((f) => (
+              <div key={'b-' + f.id} className="flex items-center justify-between rounded-lg border px-3 py-2.5" style={{ borderColor: T.border }}>
+                <div>
+                  <p className="text-sm font-medium" style={{ color: T.ink }}>Give {classLabel(state, conflict.classB)} {'\u00b7'} {conflict.subjB?.name} to {f.name}</p>
+                  <p className="text-xs" style={{ color: T.success }}>Eligible {'\u00b7'} free at this slot</p>
+                </div>
+                <PrimaryButton onClick={() => applyFacultyReassign(conflict.entryB, f)}>Apply</PrimaryButton>
+              </div>
+            ))}
+            {altForA.map((f) => (
+              <div key={'a-' + f.id} className="flex items-center justify-between rounded-lg border px-3 py-2.5" style={{ borderColor: T.border }}>
+                <div>
+                  <p className="text-sm font-medium" style={{ color: T.ink }}>Give {classLabel(state, conflict.classA)} {'\u00b7'} {conflict.subjA?.name} to {f.name}</p>
+                  <p className="text-xs" style={{ color: T.success }}>Eligible {'\u00b7'} free at this slot</p>
+                </div>
+                <PrimaryButton onClick={() => applyFacultyReassign(conflict.entryA, f)}>Apply</PrimaryButton>
+              </div>
+            ))}
+          </>
+        ) : (
+          <div className="flex items-center justify-between rounded-lg border px-3 py-2.5" style={{ borderColor: T.border }}>
+            <div>
+              <p className="text-sm font-medium" style={{ color: T.ink }}>Assign another available faculty</p>
+              <p className="text-xs" style={{ color: T.muted }}>No other eligible faculty is free at this slot {'\u2014'} edit the grid manually.</p>
+            </div>
+            <GhostButton
+              onClick={() => {
+                const target = conflict.classB || conflict.classA;
+                onClose();
+                if (target) actions.openClassForEdit(target);
+                else actions.setPage('createTimetable');
+              }}
+            >
+              Open grid
+            </GhostButton>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -3472,7 +3559,7 @@ function ResolveConflictPanel({ state, actions, conflict, onClose }) {
 
 // One class's full timetable, read-only, laid out exactly like the grid on Create Timetable:
 // subject, teacher and room in every box, conflicts in red, plus a coverage strip.
-function ClassTimetableCard({ state, conflicts, cs }) {
+function ClassTimetableCard({ state, conflicts, cs, onEdit }) {
   const periodSlots = state.periods.filter((p) => p.type === 'period');
   const entries = state.timetableEntries.filter((e) => e.classSectionId === cs.id);
   const room = cs.roomId ? state.classrooms.find((r) => r.id === cs.roomId) : null;
@@ -3494,6 +3581,7 @@ function ClassTimetableCard({ state, conflicts, cs }) {
             {entries.length}{required ? ' / ' + required : ''} periods
           </Badge>
           {classConflicts > 0 && <Badge tone="critical">{classConflicts} in conflict</Badge>}
+          {onEdit && <GhostButton icon={Pencil} onClick={() => onEdit(cs)}>Edit</GhostButton>}
         </div>
       </div>
 
@@ -3565,7 +3653,7 @@ function ClassTimetableCard({ state, conflicts, cs }) {
   );
 }
 
-function TimetableOverview({ state, conflicts, initialDept = 'ALL' }) {
+function TimetableOverview({ state, conflicts, initialDept = 'ALL', onEditClass }) {
   const [dept, setDept] = useState(initialDept);
   const [year, setYear] = useState('ALL');
   const [hideEmpty, setHideEmpty] = useState(false);
@@ -3612,7 +3700,7 @@ function TimetableOverview({ state, conflicts, initialDept = 'ALL' }) {
             <p className="ts-display mb-3 text-sm font-semibold" style={{ color: T.ink }}>{d.id} {'\u2014'} {d.name}</p>
             <div className="space-y-5">
               {classes.filter((c) => c.departmentId === d.id).map((c) => (
-                <ClassTimetableCard key={c.id} state={state} conflicts={conflicts} cs={c} />
+                <ClassTimetableCard key={c.id} state={state} conflicts={conflicts} cs={c} onEdit={onEditClass} />
               ))}
             </div>
           </section>
