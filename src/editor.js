@@ -16,9 +16,11 @@
 //   { op:'remove', subjectId, dayOrderId?, periodId?, forbid? }
 //   { op:'set',    subjectId, dayOrderId, periodId, facultyId? }
 // ---------------------------------------------------------------------------
-import { isCombinedPair, planForClassSection } from './solver.js';
+import { isCombinedPair, planForClassSection, isMixedSubject } from './solver.js';
 
 const isLab = (s) => !!s && (s.type === 'Lab' || s.labRequired === true);
+// Theory + Lab subjects: only their LAB entries behave as a lab block (moved together, never split).
+const isLabEntry = (e, s) => isLab(s) || (isMixedSubject(s) && e.type === 'lab');
 
 export function applyChangeOps({ state, classSection: cs, ops }) {
   const periodSlots = state.periods.filter((p) => p.type === 'period');
@@ -139,7 +141,8 @@ export function applyChangeOps({ state, classSection: cs, ops }) {
   }
 
   function moveLabBlock(X, op) {
-    const block = find({ subjectId: X.subjectId, dayOrderId: X.dayOrderId });
+    const block = find({ subjectId: X.subjectId, dayOrderId: X.dayOrderId })
+      .filter((e) => !isMixedSubject(subjectsById.get(X.subjectId)) || e.type === 'lab');
     const n = block.length;
     const toDay = op.to?.dayOrderId || X.dayOrderId;
     const ignore = new Set(block.map((e) => e.id));
@@ -173,13 +176,13 @@ export function applyChangeOps({ state, classSection: cs, ops }) {
       if (op.op === 'move') {
         const X = find({ subjectId: op.subjectId, dayOrderId: op.from?.dayOrderId, periodId: op.from?.periodId })[0];
         if (!X) { say(false, 'No ' + nameOf(op.subjectId) + ' period found' + (op.from?.dayOrderId ? ' on ' + where(op.from.dayOrderId, op.from.periodId) : '') + ' to move.'); continue; }
-        if (isLab(subjectsById.get(X.subjectId))) moveLabBlock(X, op); else moveTheory(X, op);
+        if (isLabEntry(X, subjectsById.get(X.subjectId))) moveLabBlock(X, op); else moveTheory(X, op);
       } else if (op.op === 'swap') {
         const A = find({ subjectId: op.a?.subjectId, dayOrderId: op.a?.dayOrderId, periodId: op.a?.periodId })[0];
         const B = find({ subjectId: op.b?.subjectId, dayOrderId: op.b?.dayOrderId, periodId: op.b?.periodId })[0];
         if (!A || !B) { say(false, 'Could not find both periods to swap.'); continue; }
         if (A.id === B.id) { say(false, 'Both sides of the swap are the same period.'); continue; }
-        if (isLab(subjectsById.get(A.subjectId)) || isLab(subjectsById.get(B.subjectId))) { say(false, 'Swapping lab blocks is not supported - move the lab instead.'); continue; }
+        if (isLabEntry(A, subjectsById.get(A.subjectId)) || isLabEntry(B, subjectsById.get(B.subjectId))) { say(false, 'Swapping lab blocks is not supported - move the lab instead.'); continue; }
         const ign = new Set([A.id, B.id]);
         const ra = legalAt(A, B.dayOrderId, B.periodId, ign);
         const rb = legalAt(B, A.dayOrderId, A.periodId, ign);

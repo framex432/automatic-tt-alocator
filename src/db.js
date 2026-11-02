@@ -20,7 +20,15 @@ const TABLE_BY_KEY = {
   classAssignments: 'class_assignments',
   timetableEntries: 'timetable_entries',
   activityLog: 'activity_log',
+  // per-class copy of the subject configuration a timetable was generated with
+  // (see supabase-migration-timetable-snapshots.sql). Optional: see SNAPSHOT_KEY below.
+  timetableSnapshots: 'timetable_snapshots',
 };
+
+// The snapshot table is additive. Until its migration has been run it does not exist, and that
+// must neither stop the app loading nor make a timetable save fail - snapshot read/write errors
+// are tolerated and reported back to the caller (see syncDiff) instead of thrown.
+const SNAPSHOT_KEY = 'timetableSnapshots';
 
 // camelCase JS field -> snake_case DB column, per collection. Fields not listed
 // here are assumed to already match (e.g. id, name, type, capacity).
@@ -41,6 +49,10 @@ const FIELD_MAP = {
   dayOrders: { actualDay: 'actual_day' },
   periods: { start: 'start_time', end: 'end_time' },
   activityLog: { entityType: 'entity_type', entityId: 'entity_id' },
+  timetableSnapshots: {
+    classSectionId: 'class_section_id', subjectId: 'subject_id', weeklyHours: 'weekly_hours',
+    theoryHours: 'theory_hours', labHours: 'lab_hours', facultyIds: 'faculty_ids', createdAt: 'created_at',
+  },
 };
 
 // Columns that don't exist as real DB columns for a table - derived instead
@@ -165,6 +177,16 @@ export async function loadState() {
     classAssignments = (caRows || []).map((r) => fromRow('classAssignments', r));
   }
 
+  // timetable_snapshots is loaded separately for the same reason: missing table => no history yet.
+  let timetableSnapshots = [];
+  const { data: snapRows, error: eSnap } = await fetchAll('timetable_snapshots', ['id']);
+  if (eSnap) {
+    // eslint-disable-next-line no-console
+    console.warn('timetable_snapshots not available yet (run supabase-migration-timetable-snapshots.sql):', eSnap.message);
+  } else {
+    timetableSnapshots = (snapRows || []).map((r) => fromRow('timetableSnapshots', r));
+  }
+
   const facultyIdsBySubject = {};
   const subjectIdsByFaculty = {};
   (subjectFaculty || []).forEach(({ subject_id, faculty_id }) => {
@@ -218,6 +240,7 @@ export async function loadState() {
     labs: (labs || []).map((r) => fromRow('labs', r)),
     classSections: (classSectionsRaw || []).map((r) => fromRow('classSections', r)),
     classAssignments,
+    timetableSnapshots,
     timetableEntries: (timetableEntriesRaw || []).map((r) => fromRow('timetableEntries', r)),
     activityLog: (activityLogRaw || []).map((r) => ({
       ...fromRow('activityLog', r),
@@ -286,9 +309,15 @@ function planCollection(key, prevList, nextList) {
 // Fall back to delete-then-insert of just those rows, which is always valid, and put
 // the old rows back if that insert fails so nothing is lost.
 async function upsertRows(key, table, rows, plan) {
-  const { error } = await supabase.from(table).upsert(rows, { onConflict: 'id' });
-  if (!error) return;
-  if (error.code !== '23505') throw error;
+  // Subjects ask Postgres to hand the saved rows back (.select()) so the caller can verify what was
+  // ACTUALLY stored instead of assuming the update worked. Other tables are unchanged.
+  const query = supabase.from(table).upsert(rows, { onConflict: 'id' });
+  const { data, error } = await (key === 'subjects' ? query.select() : query);
+  if (!error) return data || null;
+  // The delete-then-insert retry below exists ONLY for timetable periods moving/swapping cells.
+  // It must never run for any other table: for a subject it would DELETE the subject (and then be
+  // refused by every timetable row that still depends on it). Any other error is reported as-is.
+  if (key !== 'timetableEntries' || error.code !== '23505') throw error;
   const ids = rows.map((r) => r.id);
   for (const part of chunk(ids, DELETE_CHUNK)) {
     const { error: eDel } = await supabase.from(table).delete().in('id', part);
@@ -304,12 +333,29 @@ async function upsertRows(key, table, rows, plan) {
 
 async function writeCollection(key, plan) {
   const table = TABLE_BY_KEY[key];
+  const saved = [];
   for (const part of chunk(plan.inserts, INSERT_CHUNK)) {
     const { error } = await supabase.from(table).insert(part.map((r) => toRow(key, r)));
     if (error) throw error;
   }
   for (const group of groupBySignature(plan.updates.map((r) => toRow(key, r)))) {
-    for (const part of chunk(group, INSERT_CHUNK)) await upsertRows(key, table, part, plan);
+    for (const part of chunk(group, INSERT_CHUNK)) {
+      const returned = await upsertRows(key, table, part, plan);
+      if (key === 'subjects') {
+        // Verify against the record Supabase returned. An UPDATE that matched no row (or was
+        // filtered out by row-level security) comes back with NO error and NO row - that must not
+        // be treated as success.
+        const byId = new Map((returned || []).map((r) => [r.id, r]));
+        for (const sent of part) {
+          const got = byId.get(sent.id);
+          if (!got) throw new Error('Supabase did not return the updated subject (' + sent.id + ') - the update was not saved.');
+          if (got.type !== sent.type || Number(got.weekly_hours) !== Number(sent.weekly_hours)) {
+            throw new Error('Supabase saved subject ' + sent.id + ' as "' + got.type + '" / ' + got.weekly_hours + ' h, not "' + sent.type + '" / ' + sent.weekly_hours + ' h.');
+          }
+          saved.push(fromRow('subjects', got));
+        }
+      }
+    }
   }
 
   // subjects own the editable end of the faculty<->subject relationship (see
@@ -332,6 +378,7 @@ async function writeCollection(key, plan) {
       if (error) throw error;
     }
   }
+  return saved;
 }
 
 async function deleteCollection(key, plan) {
@@ -369,6 +416,41 @@ export async function syncDiff(prevState, nextState) {
   await syncCollege(prevState.college, nextState.college);
   const plans = {};
   for (const key of WRITE_ORDER) plans[key] = planCollection(key, prevState[key], nextState[key]);
-  for (const key of WRITE_ORDER) await writeCollection(key, plans[key]);
-  for (const key of DELETE_ORDER) await deleteCollection(key, plans[key]);
+  // Snapshots are written LAST and never throw: a failure there must not roll back the timetable
+  // change that triggered it. The caller is told so it can warn the user.
+  let snapshotError = null;
+  let savedSubjects = [];
+  for (const key of WRITE_ORDER) {
+    if (key === SNAPSHOT_KEY) continue;
+    const saved = await writeCollection(key, plans[key]);
+    if (key === 'subjects') savedSubjects = saved;
+  }
+  for (const key of DELETE_ORDER) if (key !== SNAPSHOT_KEY) await deleteCollection(key, plans[key]);
+  try {
+    await writeCollection(SNAPSHOT_KEY, plans[SNAPSHOT_KEY]);
+    await deleteCollection(SNAPSHOT_KEY, plans[SNAPSHOT_KEY]);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('Could not save timetable snapshots:', err);
+    snapshotError = err?.message || 'unknown error';
+  }
+  return { snapshotError, savedSubjects };
+}
+// Turns a failed sync into the message the user sees. The old catch-all treated ANY error containing
+// the word "violates" as "something still depends on it" - but a CHECK-constraint rejection (for
+// example subjects.type not allowing 'Theory + Lab') also says "violates", so a rejected type change
+// was reported as a dependency problem. Only real foreign-key errors get the dependency message.
+export function describeSyncError(err) {
+  const msg = err?.message || '';
+  const code = err?.code;
+  if (/class_assignments/i.test(msg) && /find the table|does not exist|schema cache/i.test(msg)) {
+    return 'The class-allocation table is missing. Run supabase-migration-class-assignments.sql in the Supabase SQL editor, then reload.';
+  }
+  if (/subjects/i.test(msg) && (code === '23514' || /check constraint/i.test(msg) || (code === '22P02' && /enum/i.test(msg)))) {
+    return 'The subject type could not be saved: ' + msg + '. The database does not accept this subject type yet - run supabase-migration-subject-type-theory-lab.sql in the Supabase SQL editor, then try again. Nothing was changed.';
+  }
+  if (code === '23503' || /foreign key/i.test(msg)) {
+    return 'That can\u2019t be removed while other records still depend on it. Reassign or delete those first, then try again.';
+  }
+  return 'Change could not be saved: ' + (msg || 'unknown error') + '. Nothing was changed.';
 }

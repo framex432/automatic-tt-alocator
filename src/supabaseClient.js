@@ -3,9 +3,6 @@ import { createClient } from '@supabase/supabase-js';
 const url = import.meta.env.VITE_SUPABASE_URL;
 const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
-console.log("Supabase URL exists:", !!url);
-console.log("Supabase Key exists:", !!anonKey);
-
 if (!url || !anonKey) {
   // Fails loudly at build/runtime instead of silently falling back, so a missing
   // .env.local doesn't quietly degrade into "data isn't saving" confusion later.

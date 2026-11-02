@@ -24,7 +24,7 @@
 // NOTE on security: the key ships in the browser bundle. Fine for an internal
 // staff tool; for anything public move this fetch into a Supabase Edge Function.
 // ---------------------------------------------------------------------------
-import { isCombinedPair, planForClassSection } from './solver.js';
+import { isCombinedPair, planForClassSection, isMixedSubject } from './solver.js';
 
 const GROK_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROK_MODEL = 'openai/gpt-oss-120b';
@@ -99,6 +99,8 @@ export function buildPrompt({ state, departmentId, classSection, deptSubjects, p
   const subjects = [];
   const facultyIds = new Set();
   for (const s of deptSubjects) {
+    // Theory + Lab needs an exact 2-period consecutive lab block; leave it to the local solver.
+    if (isMixedSubject(s)) continue;
     const done = existingEntriesForClass.filter((e) => e.subjectId === s.id).length;
     const need = (Number(s.weeklyHours) || 0) - done;
     const fac = (s.facultyIds || []).filter((id) => state.faculty.some((f) => f.id === id));

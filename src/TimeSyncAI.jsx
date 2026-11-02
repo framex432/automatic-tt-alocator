@@ -11,11 +11,11 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   LineChart, Line, PieChart, Pie, Cell, Legend,
 } from 'recharts';
-import { loadState, syncDiff } from './db';
+import { loadState, syncDiff, describeSyncError } from './db';
 import { supabase } from './supabaseClient';
 import { jsPDF } from 'jspdf';
 import { generateTimetableWithAI, parseChangeRequest, isGrokConfigured } from './grok';
-import { generateForClasses, planForClassSection, findOrphanEntries, coverageForClass, isCombinedPair } from './solver';
+import { generateForClasses, planForClassSection, findOrphanEntries, coverageForClass, isCombinedPair, isMixedSubject, splitMixedHours, withTimetableSnapshots, snapshotsBeforeEdit, subjectForEntry } from './solver';
 import { applyChangeOps } from './editor';
 
 const T = {
@@ -384,15 +384,9 @@ function LoginModal({ open, onClose, toast }) {
     });
     setBusy(false);
     if (signInError) {
-  console.error("Supabase Login Error:", {
-    message: signInError.message,
-    status: signInError.status,
-    code: signInError.code
-  });
-
-  setError(signInError.message);
-  return;
-}
+      setError('Incorrect password.');
+      return;
+    }
     setPassword('');
     toast('Signed in.');
     onClose();
@@ -591,10 +585,10 @@ function TimeSyncAIInner() {
     return () => sub.subscription.unsubscribe();
   }, []);
 
-  const toast = useCallback((msg, tone = 'success') => {
+  const toast = useCallback((msg, tone = 'success', duration = 3200) => {
     const id = uid('TOAST');
     setToasts((t) => [...t, { id, msg, tone }]);
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3200);
+    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), duration);
   }, []);
 
   const persist = useCallback((next) => {
@@ -604,12 +598,26 @@ function TimeSyncAIInner() {
       // through — covers all of them without touching each call site.
       setLoginOpen(true);
       toast('Please sign in to make changes.', 'critical');
-      return;
+      return Promise.resolve(false);
     }
     const prev = state;
+    // Newly generated timetables get a snapshot of the subject configuration they were built with.
+    next = withTimetableSnapshots(prev, next);
     // Optimistic: update the UI immediately, sync to Supabase in the background.
     setState(next);
-    syncDiff(prev, next).catch((err) => {
+    // Returns a promise<boolean>: true only once Supabase has confirmed the save. Callers that show a
+    // success message await it; every other caller ignores the return value exactly as before.
+    return syncDiff(prev, next).then((res) => {
+      // Master Data shows what Supabase actually stored for a changed subject, not our local guess.
+      if (res?.savedSubjects?.length) {
+        const savedById = new Map(res.savedSubjects.map((r) => [r.id, r]));
+        setState((cur) => ({ ...cur, subjects: cur.subjects.map((x) => (savedById.has(x.id) ? { ...x, ...savedById.get(x.id) } : x)) }));
+      }
+      if (res?.snapshotError) {
+        toast('Saved, but timetable history (snapshots) could not be stored. Run supabase-migration-timetable-snapshots.sql in the Supabase SQL editor so old timetables keep their original subject type after a reload.', 'warn', 9000);
+      }
+      return true;
+    }).catch((err) => {
       // eslint-disable-next-line no-console
       console.error('Supabase sync failed', err);
       // Roll back to the last known-good state — without this, a rejected change
@@ -617,12 +625,8 @@ function TimeSyncAIInner() {
       // the database correctly refuses) would keep showing as "deleted" on screen
       // even though it's still there in Supabase, until the next reload.
       setState(prev);
-      const friendly = /class_assignments/i.test(err?.message || '') && /find the table|does not exist|schema cache/i.test(err?.message || '')
-        ? 'The class-allocation table is missing. Run supabase-migration-class-assignments.sql in the Supabase SQL editor, then reload.'
-        : /foreign key|violates|restrict/i.test(err?.message || '')
-        ? 'That can\u2019t be removed while other records still depend on it. Reassign or delete those first, then try again.'
-        : 'Change could not be saved: ' + (err?.message || 'unknown error') + '. Nothing was changed.';
-      toast(friendly, 'critical');
+      toast(describeSyncError(err), 'critical', 10000);
+      return false;
     });
   }, [state, toast, session]);
 
@@ -1761,7 +1765,10 @@ function SubjectRow({ s, state, actions, highlightId, onEdit }) {
       <td className="px-4 py-2.5" style={{ color: T.ink }}>{s.year}</td>
       <td className="px-4 py-2.5" style={{ color: T.ink }}>{s.type}</td>
       <td className="px-4 py-2.5" style={{ color: T.ink }}>{state.faculty.filter((f) => s.facultyIds.includes(f.id)).map((f) => f.name).join(', ') || '\u2014'}</td>
-      <td className="px-4 py-2.5" style={{ color: T.ink }}>{s.weeklyHours}</td>
+      <td className="px-4 py-2.5" style={{ color: T.ink }}>
+        {s.weeklyHours}
+        {isMixedSubject(s) && splitMixedHours(s.weeklyHours).lab > 0 && <span className="ml-1 text-xs" style={{ color: T.muted }}>({splitMixedHours(s.weeklyHours).theory}T + {splitMixedHours(s.weeklyHours).lab}L)</span>}
+      </td>
       <td className="px-4 py-2.5 text-right">
         <button onClick={() => onEdit(s)} className="rounded-md p-1.5 hover:bg-gray-100" title="Edit subject">
           <Pencil size={14} color={T.primary} />
@@ -1857,6 +1864,7 @@ function SubjectsTab({ state, actions, highlightId = null }) {
           <option value="ALL">All types</option>
           <option value="Theory">Theory</option>
           <option value="Lab">Lab</option>
+          <option value="Theory + Lab">Theory + Lab</option>
         </Select>
         {subjectFiltersActive && (
           <GhostButton onClick={() => { setSearch(''); setDeptFilter('ALL'); setYearFilter('ALL'); setTypeFilter('ALL'); }}>Clear filters</GhostButton>
@@ -1901,9 +1909,17 @@ function SubjectsTab({ state, actions, highlightId = null }) {
             <Select value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })}>
               <option value="Theory">Theory</option>
               <option value="Lab">Lab</option>
+              <option value="Theory + Lab">Theory + Lab</option>
             </Select>
           </Field>
           <Field label="Weekly hours"><Input type="number" value={form.weeklyHours} onChange={(e) => setForm({ ...form, weeklyHours: Number(e.target.value) })} /></Field>
+          {isMixedSubject(form) && (
+            <>
+              {/* Derived, read-only: theory = weekly - 2, lab is always exactly 2 consecutive periods. */}
+              <Field label="Theory hours (weekly − 2)"><Input type="number" value={splitMixedHours(form.weeklyHours).theory} readOnly disabled /></Field>
+              <Field label="Lab hours (fixed)"><Input type="number" value={splitMixedHours(form.weeklyHours).lab || 2} readOnly disabled /></Field>
+            </>
+          )}
         </div>
         <div className="mt-3">
           <span className="mb-1 block text-xs font-semibold" style={{ color: T.muted }}>
@@ -1958,9 +1974,13 @@ function SubjectsTab({ state, actions, highlightId = null }) {
         <div className="mt-4 flex gap-2">
           <PrimaryButton
             icon={editingId ? undefined : Plus}
-            onClick={() => {
+            onClick={async () => {
               if (!form.code || !form.name) { actions.toast('Enter a subject code and name.', 'critical'); return; }
               if (form.departmentIds.length === 0) { actions.toast('Choose at least one department.', 'critical'); return; }
+              if (isMixedSubject(form) && !(Number.isInteger(Number(form.weeklyHours)) && Number(form.weeklyHours) > 2)) {
+                actions.toast('Theory + Lab needs whole-number weekly hours greater than 2 (the lab is a fixed 2 hours).', 'critical');
+                return;
+              }
               if (editingId) {
                 // Same facultyIds <-> subjectIds mirroring as the faculty side (see
                 // AddFacultyModal.submit) - keep both directions of the relationship
@@ -1977,9 +1997,28 @@ function SubjectsTab({ state, actions, highlightId = null }) {
                       return f;
                     })
                   : state.faculty;
+                // Master Data only: the subject row is updated in place (same id). Timetables that
+                // already exist are NOT touched - before the edit lands, the configuration they were
+                // generated with is recorded for any class that has no snapshot yet (older timetables).
                 const nextSubjects = state.subjects.map((s) => (s.id === editingId ? { ...s, ...form, labRequired: form.type === 'Lab' } : s));
-                actions.persist(actions.logActivity({ ...state, subjects: nextSubjects, faculty: nextFaculty }, 'Subject updated: ' + form.name));
-                actions.toast('Subject updated.');
+                const configChanged = !!prevSubject && (prevSubject.type !== form.type || Number(prevSubject.weeklyHours) !== Number(form.weeklyHours) || prevSubject.name !== form.name || prevSubject.code !== form.code);
+                const keepHistory = configChanged ? snapshotsBeforeEdit(state, prevSubject) : [];
+                const typeChanged = !!prevSubject && prevSubject.type !== form.type;
+                const activity = typeChanged
+                  ? 'Subject type changed: ' + form.name + ' (' + prevSubject.type + ' \u2192 ' + form.type + ')'
+                  : 'Subject updated: ' + form.name;
+                const saved = await actions.persist(actions.logActivity(
+                  { ...state, subjects: nextSubjects, faculty: nextFaculty, timetableSnapshots: [...(state.timetableSnapshots || []), ...keepHistory] },
+                  activity,
+                ));
+                // Supabase refused or could not confirm the update: persist() has already rolled the list
+                // back and shown the real error. No success message, and the form stays open to retry.
+                if (!saved) return;
+                if (typeChanged) {
+                  actions.toast('Subject type changed successfully from ' + prevSubject.type + ' to ' + form.type + '. This change will apply only to newly generated timetables. Existing timetables will remain unchanged.', 'success', 8000);
+                } else {
+                  actions.toast('Subject updated.');
+                }
                 cancelEdit();
               } else {
                 const newId = uid('SUB');
@@ -2796,7 +2835,7 @@ function CreateTimetable({ state, actions, conflicts, initialClass = null }) {
                     {periodSlots.map((p) => {
                       const entry = entriesForClass.find((e) => e.dayOrderId === d.id && e.periodId === p.id);
                       const isConflicted = entry && conflicts.some((c) => c.entryA.id === entry.id || c.entryB.id === entry.id);
-                      const subj = entry && state.subjects.find((s) => s.id === entry.subjectId);
+                      const subj = entry && subjectForEntry(state, entry);
                       const fac = entry && state.faculty.find((f) => f.id === entry.facultyId);
                       // Room is optional on an entry - look it up only when one is actually
                       // assigned, and show a plain "-" (not blank, not an error) when it isn't,
@@ -2836,7 +2875,7 @@ function CreateTimetable({ state, actions, conflicts, initialClass = null }) {
                     const bad = c.stray || c.broken || c.scheduled > c.required;
                     const color = bad ? T.critical : c.scheduled === c.required ? T.success : T.warn;
                     return (
-                      <span key={c.subjectId} className="rounded-full border px-2.5 py-0.5 text-xs" style={{ borderColor: color, color }}>
+                      <span key={c.subjectId} title={c.snapshot ? 'Generated as ' + c.snapshot.type + ' \u00b7 ' + c.snapshot.weeklyHours + ' h/week (theory ' + c.snapshot.theoryHours + ' + lab ' + c.snapshot.labHours + ')' : undefined} className="rounded-full border px-2.5 py-0.5 text-xs" style={{ borderColor: color, color }}>
                         {c.broken ? c.name + ' \u00d7' + c.scheduled : c.stray ? c.name + ' \u00d7' + c.scheduled + ' (not in this class\u2019s plan)' : c.name + ' ' + c.scheduled + '/' + c.required}
                       </span>
                     );
@@ -3264,7 +3303,7 @@ function drawTimetableCanvas({ state, entries, subjectRows, room, department, de
         ctx.fillText(p.label, cx + periodColW / 2, rowY + classRowH / 2 + 4);
       } else {
         const e = entries.find((x) => x.dayOrderId === d.id && x.periodId === p.id);
-        const s = e && state.subjects.find((x) => x.id === e.subjectId);
+        const s = e && subjectForEntry(state, e);
         ctx.fillStyle = '#ffffff';
         ctx.fillRect(cx, rowY, periodColW, classRowH);
         ctx.fillStyle = '#111111';
@@ -3342,6 +3381,11 @@ function ExportToolbar({ state, classSection, entries, departmentId, year, secti
 
   const subjectRows = state.subjects
     .filter((s) => (s.departmentIds || []).includes(departmentId))
+    .map((live) => {
+      // a subject this class's timetable already uses is shown as that timetable was generated
+      const s = classSection && entries.some((e) => e.subjectId === live.id) ? subjectForEntry(state, { classSectionId: classSection.id, subjectId: live.id }) : live;
+      return s;
+    })
     .map((s) => ({
       ...s,
       facultyNames: state.faculty.filter((f) => s.facultyIds.includes(f.id)).map((f) => f.name).join(', ') || '\u2014',
@@ -3619,7 +3663,7 @@ function ClassTimetableCard({ state, conflicts, cs, onEdit }) {
                   {periodSlots.map((p) => {
                     const entry = entries.find((e) => e.dayOrderId === d.id && e.periodId === p.id);
                     const isConflicted = entry && conflicts.some((c) => c.entryA.id === entry.id || c.entryB.id === entry.id);
-                    const subj = entry && state.subjects.find((s) => s.id === entry.subjectId);
+                    const subj = entry && subjectForEntry(state, entry);
                     const fac = entry && state.faculty.find((f) => f.id === entry.facultyId);
                     const rm = entry?.roomId ? state.classrooms.find((r) => r.id === entry.roomId) || state.labs.find((r) => r.id === entry.roomId) : null;
                     const broken = entry && (!subj || !fac);
@@ -3647,7 +3691,7 @@ function ClassTimetableCard({ state, conflicts, cs, onEdit }) {
               const bad = c.stray || c.broken || c.scheduled > c.required;
               const color = bad ? T.critical : c.scheduled === c.required ? T.success : T.warn;
               return (
-                <span key={c.subjectId} className="rounded-full border px-2.5 py-0.5 text-xs" style={{ borderColor: color, color }}>
+                <span key={c.subjectId} title={c.snapshot ? 'Generated as ' + c.snapshot.type + ' \u00b7 ' + c.snapshot.weeklyHours + ' h/week (theory ' + c.snapshot.theoryHours + ' + lab ' + c.snapshot.labHours + ')' : undefined} className="rounded-full border px-2.5 py-0.5 text-xs" style={{ borderColor: color, color }}>
                   {c.broken ? c.name + ' \u00d7' + c.scheduled : c.stray ? c.name + ' \u00d7' + c.scheduled + ' (not in plan)' : c.name + ' ' + c.scheduled + '/' + c.required}
                 </span>
               );
